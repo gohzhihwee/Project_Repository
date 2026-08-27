@@ -1,0 +1,28 @@
+# Secrets — never commit
+.env
+*.env
+
+# Cached option chain data (can be re-fetched from Databento)
+Python_version_options/option_cache/
+
+# Raw Databento CSV exports and generated output artefacts
+Python_version_options/options_data/
+Python_version_options/output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Build / dist
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
