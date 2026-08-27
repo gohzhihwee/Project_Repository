@@ -1,0 +1,49 @@
+# .dockerignore
+# Prevents these paths from being sent to the Docker build context.
+# A smaller context means faster builds and no accidental secret leakage.
+
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# Editor and OS artefacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Test artefacts
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Jupyter notebooks (not needed at runtime)
+*.ipynb
+.ipynb_checkpoints/
+
+# Output directory (written by the container, not an input)
+output/
+
+# Docker files themselves (no need to copy into the image)
+Dockerfile
+docker-compose.yml
+.dockerignore

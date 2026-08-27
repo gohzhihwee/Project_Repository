@@ -1,0 +1,33 @@
+# requirements.txt
+# Verified conflict-free on Python 3.12 via pip check in a clean virtualenv.
+#
+# Install:
+#   pip install -r requirements.txt
+#
+# ── Direct dependencies ────────────────────────────────────────────────────
+numpy==1.26.4          # array maths; upper-bounded to <2 for scipy/sklearn ABI
+pandas==2.2.3          # DataFrames throughout all modules
+scipy==1.13.1          # norm/t distributions (models.py, ensemble.py)
+databento              # Databento API client — only needed if reverting to API mode; not used in CSV mode
+python-dotenv>=1.0.0   # loads .env into os.environ at startup
+scikit-learn==1.5.2    # GradientBoostingRegressor, MultiOutputRegressor, StandardScaler
+nolds==0.6.3           # hurst_rs (models.py) — 0.6.3 is the minimum that works on Python 3.12
+yfinance==0.2.61       # SPY historical data download (main.py standalone backtester)
+tqdm==4.66.4           # progress bar (calculate_mmar_returns in models.py)
+matplotlib==3.9.4      # chart generation (visualization.py) — Agg backend, no display needed
+seaborn==0.13.2        # monthly returns heatmap (visualization.py)
+
+# ── Key transitive dependencies (pinned for reproducibility) ───────────────
+setuptools>=68.0       # provides pkg_resources, required by nolds on Python 3.12
+joblib==1.5.3          # required by scikit-learn
+threadpoolctl==3.6.0   # required by scikit-learn
+python-dateutil==2.9.0.post0  # required by pandas
+pytz==2026.2           # required by pandas
+six==1.17.0            # required by python-dateutil
+future==1.0.0          # required by nolds
+requests==2.34.2       # required by yfinance
+multitasking==0.0.13   # required by yfinance
+frozendict==2.4.7      # required by yfinance
+peewee==4.0.6          # required by yfinance
+beautifulsoup4==4.14.3 # required by yfinance
+curl_cffi==0.15.0      # required by yfinance (HTTP/2 support)
