@@ -1,0 +1,70 @@
+
+services:
+
+  backtester:
+
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+      target: runtime
+
+    image: options-backtester:latest
+
+    container_name: options_backtester
+
+
+    environment:
+
+      PYTHONUNBUFFERED: "1"
+
+      PYTHONDONTWRITEBYTECODE: "1"
+
+      HTTPS_PROXY: "${HTTPS_PROXY:-}"
+
+
+    env_file:
+      - .env
+
+    volumes:
+
+      - type: bind
+        source: ./output
+        target: /app/output
+
+      - type: bind
+        source: ./options_data
+        target: /app/options_data
+
+      - type: bind
+        source: ./option_cache
+        target: /app/option_cache
+
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+
+    restart: "no"
+
+
+    networks:
+      - backtester_net
+
+
+networks:
+  backtester_net:
+    driver: bridge
