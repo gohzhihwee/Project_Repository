@@ -1,87 +1,39 @@
 from AlgorithmImports import *          # resolved via local stub
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
-from concurrent.futures import ThreadPoolExecutor
 import nolds
-from tqdm import tqdm
 import math
 from scipy.stats import norm
+from scipy.special import ndtr
 
-def bs_call_mc(S, K, r, sigma, T, t, Ite):
-  z = np.random.normal(0, 1, Ite) # Generate z as a 1D array
-  # Ensure S is treated as a scalar
-  ST = S * np.exp((T - t)*(r - 0.5 * sigma**2) + sigma * np.sqrt(T - t) * z)
-  # Calculate payoffs directly as a 1D array
-  payoffs = np.maximum(0, ST - K)
+# Base seed for the deterministic RNG streams used in Monte Carlo pricing:
+# every (model, date) simulation spawns its own SeedSequence from this.
+RNG_BASE_SEED = 42
 
-  average_payoff = np.sum(payoffs) / float(Ite) # Calculate average of payoffs
+# Monte Carlo pricing configuration (OOS prices for BS/Merton/Heston/Bates).
+# N_MC_PATHS: total paths per (model, date), as 5,000 antithetic pairs.
+# MC_STEPS_PER_YEAR: time-step density of the simulation grid (4 steps per
+#   trading day); the grid additionally contains every contract maturity
+#   exactly. BS/Merton increments are exact at any step; for Heston/Bates at
+#   the fitted vol-of-vol (ξ ≈ 1.7–2, Feller violated) daily Euler steps left a
+#   +$0.12 mean bias vs the closed form, which 4 steps/day removes (residual
+#   gap = MC noise, median SE ≈ $0.09 at 10k paths).
+N_MC_PATHS = 10_000
+MC_STEPS_PER_YEAR = 252 * 4
 
-  return np.exp(-r * (T - t)) * average_payoff
+# MMAR trading-time cascade: 2^8 = 256 dyadic cells of one trading day each,
+# i.e. a ~1-year base horizon that exceeds the longest (90-day) maturity, so
+# θ(T) is random for every priced contract.
+CASCADE_LEVELS = 8
+CASCADE_CELLS = 2 ** CASCADE_LEVELS
+TRADING_DAYS_PER_YEAR = 252
 
-def bs_put_mc(S, K, r, sigma, T, t, Ite):
-  z = np.random.normal(0, 1, Ite) # Generate z as a 1D array
-  # Ensure S is treated as a scalar
-  ST = S * np.exp((T - t)*(r - 0.5 * sigma**2) + sigma * np.sqrt(T - t) * z)
-  # Calculate payoffs directly as a 1D array
-  payoffs = np.maximum(0, K - ST)
 
-  average_payoff = np.sum(payoffs) / float(Ite) # Calculate average of payoffs
-
-  return np.exp(-r * (T - t)) * average_payoff
-
-def SDE_vol(v0, kappa, theta, sigma, T, M, Ite, rand, row, cho_matrix):
-  dt = T/M
-  v = np.zeros((M + 1, Ite), dtype=float)
-  v[0] = v0
-  sdt = np.sqrt(dt)
-  for t in range(1, M + 1):
-    ran = np.dot(cho_matrix, rand[:, t])
-    # Ensure non-negativity of volatility
-    v[t] = np.maximum(0, v[t - 1] + kappa * (theta - v[t - 1]) * dt + sigma * sdt * ran[row])
-  return v
-
-def Heston_paths(S0, r, v_paths, T, M, Ite, rand, row, cho_matrix):
-  dt = T/M
-  S = np.zeros((M + 1, Ite), dtype=float)
-  S[0] = S0
-  sdt = np.sqrt(dt)
-  for t in range(1, M + 1, 1):
-    ran = np.dot(cho_matrix, rand[:, t])
-    # Use the simulated volatility path
-    S[t] = S[t - 1] * np.exp((r - 0.5 * v_paths[t]) * dt + np.sqrt(v_paths[t]) * sdt * ran[row])
-  return S
-
-def random_number_gen(M, Ite):
-  # Generate 2 sets of random numbers for correlated simulation
-  rand = np.random.standard_normal((2, M + 1, Ite))
-  return rand
-
-# The following simplified MC functions will be replaced later with functions
-# that use the simulated paths. Keeping them for now to avoid breaking subsequent cells.
-def heston_call_mc(S, K, r, T, t):
-  # Placeholder: This should ideally use simulated paths
-  payoff = np.maximum(0, S - K)
-  average = payoff
-  return np.exp(-r * (T - t)) * average
-
-def heston_put_mc(S, K ,r, T, t):
-  # Placeholder: This should ideally use simulated paths
-  payoff = np.maximum(0, K - S)
-  average = payoff
-  return np.exp(-r * (T - t)) * average
-
-def merton_call_mc(S, K, r, T, t):
-  # Placeholder: This should ideally use simulated paths with jumps
-  payoff = np.maximum(0, S - K)
-  average = payoff
-  return np.exp(-r * (T - t)) * average
-
-def merton_put_mc(S, K ,r, T, t):
-  # Placeholder: This should ideally use simulated paths with jumps
-  payoff = np.maximum(0, K - S)
-  average = payoff
-  return np.exp(-r * (T - t)) * average
+# ---------------------------------------------------------------------------
+# Legacy notebook helpers (Hurst by R/S segments, partition-function
+# utilities). Not used by the pricing pipeline except calculate_hurst_for_segments,
+# which feeds the strategy selector's regime features.
+# ---------------------------------------------------------------------------
 
 def segment_data(data, num_segments):
 
@@ -184,414 +136,240 @@ def calculate_trading_time(layers:int, lognormal_cascade:list):
     trading_time = 2**layers*np.cumsum(lognormal_cascade)/sum(lognormal_cascade)
     return trading_time
 
-def calculate_magnitude_parameter(initial_value:float, eps:float, steps:float, number_of_path:int, real_std:float, layers:int, hurst_exponent:float):
 
-    diff = np.inf
-    magnitude_parameter = initial_value
+# ---------------------------------------------------------------------------
+# Returns-based Hurst exponent (MMAR partition-function estimator)
+# ---------------------------------------------------------------------------
 
-    while abs(diff) > eps:
-        std_list = []
-        for nb in range(number_of_path): # excluding tqdm for a less verbose output
-            n_steps = 10*2**layers+1
-            fbm_simulation = generate_fbm_path(n_steps, hurst_exponent, dt=1, s0=0)
-            fbm_simulation = fbm_simulation * magnitude_parameter  # Scale by magnitude_parameter
-            std_list.append(np.std(fbm_simulation))
-        diff = real_std - np.median(std_list)
-        print('Diff: ', diff)
-        if abs(diff) > eps:
-            magnitude_parameter += diff * steps
-            print('new magnitude_parameter:', magnitude_parameter)
+def estimate_hurst_partition(log_returns: np.ndarray,
+                             q_grid: np.ndarray | None = None,
+                             n_deltas: int = 12) -> dict:
+    """
+    MMAR partition-function estimator (Calvet & Fisher 2002). For block
+    length Δt, S_q(Δt) = Σ_i |X(iΔt+Δt) − X(iΔt)|^q over non-overlapping
+    blocks scales as Δt^{τ(q)} (the block count contributes Δt^{-1} to
+    E|X(Δt)|^q ∝ Δt^{τ(q)+1}). τ(q) is the OLS slope of log S_q on log Δt;
+    H = 1/q* where τ(q*) = 0, consistent with τ(q)+1 = qH at the root.
+    Brownian motion gives τ(q) = q/2 − 1, q* = 2, H = ½.
 
-    return  magnitude_parameter
+    Returns {'hurst', 'q_star', 'q', 'tau'}; 'hurst' is NaN if τ has no root
+    on the q grid.
+    """
+    r = np.asarray(log_returns, dtype=float)
+    r = r[np.isfinite(r)]
+    if q_grid is None:
+        q_grid = np.arange(0.5, 6.0001, 0.05)
+    n = len(r)
+    deltas = np.unique(np.logspace(0, math.log10(max(n // 10, 2)), n_deltas).astype(int))
+    log_S = np.empty((len(q_grid), len(deltas)))
+    for j, d in enumerate(deltas):
+        nb = n // d
+        blocks = np.abs(r[:nb * d].reshape(nb, d).sum(axis=1))
+        log_S[:, j] = np.log(np.sum(blocks[None, :] ** q_grid[:, None], axis=1))
+    log_d = np.log(deltas)
+    x = log_d - log_d.mean()
+    tau = (log_S - log_S.mean(axis=1, keepdims=True)) @ x / (x @ x)
+    crossing = np.where((tau[:-1] < 0) & (tau[1:] >= 0))[0]
+    if len(crossing) == 0:
+        return {'hurst': float('nan'), 'q_star': float('nan'), 'q': q_grid, 'tau': tau}
+    i = crossing[0]
+    q_star = q_grid[i] - tau[i] * (q_grid[i + 1] - q_grid[i]) / (tau[i + 1] - tau[i])
+    return {'hurst': float(1.0 / q_star), 'q_star': float(q_star), 'q': q_grid, 'tau': tau}
 
-def calculate_mmar_returns(S0:float, number_of_path:int, layers:int, hurst_exponent:float, trading_time:list, magnitude_parameter:float, time_window_base:float=10):
 
-    mmar_returns = []
-    mmar_prices = []
+# ---------------------------------------------------------------------------
+# Monte Carlo pricing: one vectorised simulation per (model, date), shared by
+# every contract on that date (common random numbers across contracts).
+# ---------------------------------------------------------------------------
 
-    for nb in tqdm(range(number_of_path)):
-        n_steps = 10*2**layers+1
-        fbm_simulation = generate_fbm_path(n_steps, hurst_exponent, dt=1, s0=0)
-        fbm_simulation = fbm_simulation * magnitude_parameter  # Scale by magnitude_parameter
-        fbm_simulation = fbm_simulation[1:]
+def _simulation_grid(T: np.ndarray) -> np.ndarray:
+    """Daily steps up to max(T), plus every contract maturity exactly."""
+    T_max = float(np.max(T))
+    daily = np.arange(1, int(math.ceil(T_max * MC_STEPS_PER_YEAR)) + 1) / MC_STEPS_PER_YEAR
+    return np.unique(np.concatenate([daily[daily < T_max], np.asarray(T, dtype=float)]))
 
-        simulated_xt_array = [0 for x in range(0, len(trading_time))]
-        for i in range(0, len(trading_time)):
-            idx = int(min(trading_time[i]*10, len(fbm_simulation)-1))
-            simulated_xt_array[i] = fbm_simulation[idx]
-        mmar_returns.append(simulated_xt_array)
 
-        simulated_prices_array = S0 * np.exp(simulated_xt_array)
-        mmar_prices.append(simulated_prices_array)
+def _antithetic(rng, half: int) -> np.ndarray:
+    z = rng.standard_normal(half)
+    return np.concatenate([z, -z])
 
-    return mmar_returns, mmar_prices
 
-def option_pricer(paths, strike, r, T, option_type='call'):
+def simulate_log_paths(model: str, params: dict, S0: float, r: float, q: float,
+                       grid: np.ndarray, n_paths: int, rng) -> np.ndarray:
+    """
+    Simulate ln S on `grid` (years, increasing, excluding 0) under the
+    risk-neutral measure with dividend yield q. Returns (len(grid), n_paths).
 
-    if isinstance(paths, list):
-        paths = np.array(paths)
+      BS     : exact lognormal increments.
+      Merton : exact increments — diffusion plus compound-Poisson log-normal
+               jumps, drift compensated by λk.
+      Heston : log-Euler for S, full-truncation Euler for v (v⁺ = max(v,0)
+               in drift and diffusion), corr(dW_S, dW_v) = ρ.
+      Bates  : Heston + Merton jumps.
+    Antithetic pairs: normals are mirrored; Poisson counts are shared.
+    """
+    half = n_paths // 2
+    n = 2 * half
+    log_s = np.full(n, math.log(S0))
+    out = np.empty((len(grid), n))
+    has_jumps = model in ('merton', 'bates')
+    stoch_vol = model in ('heston', 'bates')
 
-    S_T = paths[:, -1]
-
-    if option_type == 'call':
-        payoffs = np.maximum(S_T - strike, 0)
-    elif option_type == 'put':
-        payoffs = np.maximum(strike - S_T, 0)
+    if has_jumps:
+        lam, mu_j, sig_j = params['lambda_jump'], params['mu_jump'], params['sigma_jump']
+        jump_comp = lam * (math.exp(mu_j + 0.5 * sig_j ** 2) - 1.0)
     else:
-        raise ValueError("Invalid option type. Use 'call' or 'put'.")
+        jump_comp = 0.0
+    if stoch_vol:
+        v = np.full(n, params['v0'])
+        kappa, theta, xi, rho = params['kappa'], params['theta'], params['sigma'], params['rho']
+        rho_c = math.sqrt(1.0 - rho ** 2)
+    else:
+        sigma = params['sigma']
 
-    option_price = np.exp(-r * T) * np.mean(payoffs)
-    return option_price # Return the calculated option price
-
-def generate_fbm_path(n, hurst, dt=1, s0=1):
-
-    dW = np.random.randn(n)
-
-    increments = dW * (dt**(hurst))
-
-    fbm_path = np.cumsum(increments)
-
-    fbm_path = fbm_path - fbm_path[0] + s0
-
-    return fbm_path
-
-def generate_multiple_paths(num_paths, n, hurst, dt=1, s0=1):
-
-    paths = []
-
-    for _ in range(num_paths):
-        prices = generate_fbm_path(n, hurst, dt, s0)
-        prices = np.where(prices > 0, prices, 0)
-        paths.append(prices)
-
-    return paths
-
-def price_options_for_strikes(paths, center=80, step=5, num_strikes=5, r=0.05, T=1):
-
-    option_prices = {}
-
-    for i in range(1, num_strikes + 1):
-        strike = center - i * step
-        option_prices[strike] = option_pricer(paths, strike, r, T, option_type='put')
-
-    for i in range(num_strikes + 1):
-        strike = center + i * step
-        option_prices[strike] = option_pricer(paths, strike, r, T, option_type='call')
-
-    return option_prices
-
-# Helper function to calculate Black-Scholes price for a single option
-def calculate_bs_price(S, K, r, sigma, T, num_paths):
-    t = 0 # Calculation starts at time t=0
-    return bs_call_mc(S, K, r, sigma, T, t, num_paths), bs_put_mc(S, K, r, sigma, T, t, num_paths)
-
-def _sample_cascade(layers: int, v: float, ln_lambda: float, ln_sigma: float) -> np.ndarray:
-    """Recursively sample a lognormal cascade, returning a flat array of 2^layers leaf values."""
-    if layers == 0:
-        return np.array([v])
-    m0 = np.random.lognormal(ln_lambda, ln_sigma)
-    m1 = np.random.lognormal(ln_lambda, ln_sigma)
-    total = m0 + m1
-    m0, m1 = (m0 / total) * v, (m1 / total) * v
-    return np.concatenate([
-        _sample_cascade(layers - 1, m0, ln_lambda, ln_sigma),
-        _sample_cascade(layers - 1, m1, ln_lambda, ln_sigma),
-    ])
-
-
-def calculate_mmar_price(S0: float, K: float, r: float, T: float,
-                         hurst: float, num_paths: int,
-                         n_steps_per_year: int = 252) -> tuple:
-    """
-    MMAR (Multifractal Model of Asset Returns) option pricing.
-    Uses a lognormal cascade to generate multifractal trading time, then
-    subordinates an fBM path to that time-change before discounting payoffs.
-    """
-    n_steps = max(int(n_steps_per_year * T), 2)
-    # Cascade depth 5 gives 32 time buckets — fast enough for per-contract intraday calls
-    CASCADE_LAYERS = 5
-    # Normalised cascade parameters: E[M_i]=1, typical multifractal width for equity
-    ln_lambda = -0.5 * np.log(2)
-    ln_sigma  = np.sqrt(np.log(2) / 2.0)
-
-    mmar_paths = []
-    for _ in range(num_paths):
-        # 1. Generate multifractal trading time on [0,1]
-        flat_cascade  = _sample_cascade(CASCADE_LAYERS, 1.0, ln_lambda, ln_sigma)
-        trading_time  = np.cumsum(flat_cascade) / flat_cascade.sum()  # shape (2^CASCADE_LAYERS,)
-        n_tt          = len(trading_time)
-
-        # 2. Generate an fBM path at T-scaled increments
-        fbm = generate_fbm_path(n_steps + 1, hurst, dt=T / n_steps, s0=0.0)
-
-        # 3. Subordinate: at each real-time step i/n_steps, find the multifractal
-        #    trading time mt and index into the fBM path
-        path = np.empty(n_steps + 1)
-        path[0] = S0
-        drift = r - 0.5 * (hurst * 0.2) ** 2  # approximate drift term
-        for i in range(1, n_steps + 1):
-            real_t  = i / n_steps                              # in [0, 1]
-            tt_idx  = min(int(real_t * n_tt), n_tt - 1)
-            mt      = trading_time[tt_idx]                     # multifractal time in [0, 1]
-            fbm_idx = min(int(mt * n_steps), n_steps)
-            log_ret = fbm[fbm_idx] + drift * T * real_t
-            path[i] = S0 * np.exp(log_ret)
-
-        mmar_paths.append(np.maximum(path, 0.0))
-
-    call_price = option_pricer(mmar_paths, K, r, T, option_type='call')
-    put_price  = option_pricer(mmar_paths, K, r, T, option_type='put')
-    return call_price, put_price
-
-# Helper function to calculate Heston price for a single option (using improved MC simulation)
-def calculate_heston_price(S0, K, r, T, heston_params, num_paths, n_steps_per_year=252):
-    M = int(n_steps_per_year * T) # Number of steps
-    if M < 1: # Ensure at least one step for simulation
-        M = 1
-    Ite = num_paths # Number of iterations
-
-    # Generate random numbers and Cholesky matrix for correlated simulation
-    # Generate 2 sets of random numbers for correlated simulation
-    rand = np.random.standard_normal((2, M + 1, Ite))
-    # Calculate Cholesky decomposition of the covariance matrix for price and volatility
-    # Assuming a 2x2 covariance matrix where the diagonal elements are 1 and rho is the off-diagonal
-    cov_matrix = np.array([[1, heston_params['rho']], [heston_params['rho'], 1]])
-    # Ensure the covariance matrix is positive semi-definite before Cholesky decomposition
-    try:
-        cho_matrix = np.linalg.cholesky(cov_matrix)
-    except np.linalg.LinAlgError:
-        print("Warning: Covariance matrix is not positive semi-definite. Using diagonal matrix.")
-        cho_matrix = np.eye(2) # Use identity matrix if decomposition fails
-
-
-    # Simulate volatility paths
-    v_paths = SDE_vol(heston_params['v0'], heston_params['kappa'], heston_params['theta'], heston_params['sigma'], T, M, Ite, rand, 1, cho_matrix) # row 1 for volatility
-
-    # Simulate asset price paths using the simulated volatility
-    S_paths = Heston_paths(S0, r, v_paths, T, M, Ite, rand, 0, cho_matrix) # row 0 for price
-
-
-    # Calculate option prices from the simulated paths
-    call_price = option_pricer(S_paths, K, r, T, option_type='call')
-    put_price = option_pricer(S_paths, K, r, T, option_type='put')
-
-    return call_price, put_price
-
-
-# Helper function to calculate Merton price for a single option (needs proper MC implementation)
-def calculate_merton_price(S0, K, r, T, merton_params, num_paths, annualized_volatility, n_steps_per_year=252):
-    M = int(n_steps_per_year * T) # Number of steps
-    if M < 1: # Ensure at least one step for simulation
-        M = 1
-    Ite = num_paths # Number of iterations
-    dt = T / M
-
-    lambda_jump = merton_params['lambda_jump']
-    mu_jump = merton_params['mu_jump']
-    sigma_jump = merton_params['sigma_jump']
-
-    # Calculate compensated drift for the continuous part
-    # This ensures the expected return is r
-    compensated_drift = r - 0.5 * annualized_volatility**2 - lambda_jump * (np.exp(mu_jump + 0.5 * sigma_jump**2) - 1)
-
-
-    S_paths = np.zeros((M + 1, Ite), dtype=float)
-    S_paths[0] = S0
-
-    for i in range(Ite):
-        for t in range(M):
-            # Continuous part (Brownian Motion)
-            dW = np.random.normal(0, np.sqrt(dt))
-            continuous_return = compensated_drift * dt + annualized_volatility * dW # Using annualized_volatility as the volatility for the continuous part
-
-            # Jump part (Poisson process + jump size)
-            num_jumps = np.random.poisson(lambda_jump * dt) # Number of jumps in this small time step
-            jump_return = 0
-            if num_jumps > 0:
-                # Sum of jump sizes (log-normally distributed)
-                jump_sizes = np.random.normal(mu_jump, sigma_jump, num_jumps)
-                jump_return = np.sum(jump_sizes)
-
-
-            # Total return for the time step
-            total_return = continuous_return + jump_return
-
-            # Update price
-            S_paths[t + 1, i] = S_paths[t, i] * np.exp(total_return)
-
-    # Ensure prices are non-negative
-    S_paths = np.maximum(0, S_paths)
-
-
-    # Calculate option prices from the simulated paths
-    call_price = option_pricer(S_paths, K, r, T, option_type='call')
-    put_price = option_pricer(S_paths, K, r, T, option_type='put')
-
-    return call_price, put_price
-
-# Helper function to calculate Bates price for a single option (combining Heston and Merton)
-def calculate_bates_price(S0, K, r, T, heston_params, merton_params, num_paths, n_steps_per_year=252):
-    M = int(n_steps_per_year * T) # Number of steps
-    if M < 1:
-        M = 1
-    Ite = num_paths
-    dt = T / M
-
-    # Heston parameters
-    v0 = heston_params['v0']
-    kappa = heston_params['kappa']
-    theta = heston_params['theta']
-    sigma_heston = heston_params['sigma'] # Renamed to avoid conflict
-    rho = heston_params['rho']
-
-    # Merton parameters
-    lambda_jump = merton_params['lambda_jump']
-    mu_jump = merton_params['mu_jump']
-    sigma_jump = merton_params['sigma_jump']
-
-    # Calculate Cholesky decomposition for correlated price and volatility Brownian motions
-    cov_matrix = np.array([[1, rho], [rho, 1]])
-    try:
-        cho_matrix = np.linalg.cholesky(cov_matrix)
-    except np.linalg.LinAlgError:
-        print("Warning: Covariance matrix is not positive semi-definite for Bates. Using diagonal matrix.")
-        cho_matrix = np.eye(2)
-
-
-    S_paths = np.zeros((M + 1, Ite), dtype=float)
-    v_paths = np.zeros((M + 1, Ite), dtype=float)
-    S_paths[0] = S0
-    v_paths[0] = v0
-
-    # Compensated drift for the continuous price process under Bates
-    # The drift depends on the current volatility and the jump component
-    # The total expected return should be r
-    # The continuous part's drift is r - 0.5*v[t] - lambda_jump * (exp(mu_jump + 0.5*sigma_jump^2) - 1)
-    jump_compensation = lambda_jump * (np.exp(mu_jump + 0.5 * sigma_jump**2) - 1)
-
-
-    for i in range(Ite):
-        # Generate all random numbers for this path at once for efficiency
-        rand_vol = np.random.normal(0, np.sqrt(dt), M)
-        rand_price = np.random.normal(0, np.sqrt(dt), M)
-        jump_poisson = np.random.poisson(lambda_jump * dt, M)
-        # Generate jump sizes only if jumps occur (max number of jumps is M in this simplified approach)
-        max_possible_jumps = np.sum(jump_poisson)
-        if max_possible_jumps > 0:
-             jump_sizes_rv = np.random.normal(mu_jump, sigma_jump, max_possible_jumps)
+    t_prev = 0.0
+    for k, t in enumerate(grid):
+        dt = t - t_prev
+        t_prev = t
+        z1 = _antithetic(rng, half)
+        if stoch_vol:
+            vp = np.maximum(v, 0.0)
+            z2 = _antithetic(rng, half)
+            log_s += (r - q - jump_comp - 0.5 * vp) * dt + np.sqrt(vp * dt) * z1
+            v = v + kappa * (theta - vp) * dt + xi * np.sqrt(vp * dt) * (rho * z1 + rho_c * z2)
         else:
-             jump_sizes_rv = np.array([])
-
-        jump_size_idx = 0
-
-        # Corrected loop range: iterate from 0 to M-1 to update indices 1 to M
-        for t in range(M):
-            # Correlated Brownian Motions
-            correlated_rand = np.dot(cho_matrix, np.array([rand_price[t], rand_vol[t]]))
-            dW1 = correlated_rand[0] # For price
-            dW2 = correlated_rand[1] # For volatility
-
-            # Simulate Volatility (Heston part)
-            v_paths[t + 1, i] = np.maximum(0, v_paths[t, i] + kappa * (theta - v_paths[t, i]) * dt + sigma_heston * dW2 * np.sqrt(v_paths[t, i]))
-
-            # Simulate Price (Heston + Merton parts)
-            continuous_drift = r - 0.5 * v_paths[t + 1, i] - jump_compensation # Use updated volatility
-            continuous_return = continuous_drift * dt + np.sqrt(v_paths[t + 1, i]) * dW1 # Use updated volatility
+            log_s += (r - q - jump_comp - 0.5 * sigma ** 2) * dt + sigma * math.sqrt(dt) * z1
+        if has_jumps:
+            n_j = rng.poisson(lam * dt, half)
+            n_j = np.concatenate([n_j, n_j])
+            zj = _antithetic(rng, half)
+            log_s += n_j * mu_j + np.sqrt(n_j) * sig_j * zj
+        out[k] = log_s
+    return out
 
 
-            # Jump part
-            num_jumps_step = jump_poisson[t]
-            jump_return = 0
-            if num_jumps_step > 0:
-                # Sum jump sizes for this step
-                current_jump_sizes = jump_sizes_rv[jump_size_idx : jump_size_idx + num_jumps_step]
-                jump_return = np.sum(current_jump_sizes)
-                jump_size_idx += num_jumps_step
-
-
-            # Total return
-            total_return = continuous_return + jump_return
-
-            # Update price
-            S_paths[t + 1, i] = S_paths[t, i] * np.exp(total_return)
-
-
-    # Ensure prices are non-negative
-    S_paths = np.maximum(0, S_paths)
-
-
-    # Calculate option prices from the simulated paths
-    call_price = option_pricer(S_paths, K, r, T, option_type='call')
-    put_price = option_pricer(S_paths, K, r, T, option_type='put')
-
-    return call_price, put_price
-
-def _calculate_bs_price_worker(S, K, r, sigma, T, num_paths):
-    """Thread-safe wrapper for BS pricing"""
-    t = 0
-    return ('BS', calculate_bs_price(S, K, r, sigma, T, num_paths))
-
-def _calculate_mmar_price_worker(S, K, r, T, hurst, num_paths):
-    """Thread-safe wrapper for MMAR pricing"""
-    return ('MMAR', calculate_mmar_price(S, K, r, T, hurst, num_paths))
-
-def _calculate_heston_price_worker(S, K, r, T, heston_params, num_paths):
-    """Thread-safe wrapper for Heston pricing"""
-    return ('Heston', calculate_heston_price(S, K, r, T, heston_params, num_paths))
-
-def _calculate_merton_price_worker(S, K, r, T, merton_params, num_paths, volatility):
-    """Thread-safe wrapper for Merton pricing"""
-    return ('Merton', calculate_merton_price(S, K, r, T, merton_params, num_paths, volatility))
-
-def _calculate_bates_price_worker(S, K, r, T, heston_params, merton_params, num_paths):
-    """Thread-safe wrapper for Bates pricing"""
-    return ('Bates', calculate_bates_price(S, K, r, T, heston_params, merton_params, num_paths))
-
-def calculate_all_model_prices_concurrent(S0, K, r, T, volatility, hurst, heston_params,
-                                         merton_params, num_paths=20, max_workers=5, timeout=30):
+def mc_price_contracts(model: str, params: dict, S0: float, r: float, q: float,
+                       K: np.ndarray, T: np.ndarray, is_call: np.ndarray,
+                       n_paths: int, seed) -> tuple:
     """
-    Calculate all 5 model prices concurrently using ThreadPoolExecutor.
-
-    Args:
-        S0: Current spot price
-        K: Strike price
-        r: Risk-free rate
-        T: Time to maturity (years)
-        volatility: Annualized volatility
-        hurst: Hurst exponent for MMAR
-        heston_params: Dict with Heston parameters
-        merton_params: Dict with Merton parameters
-        num_paths: Number of MC paths
-        max_workers: Maximum concurrent threads
-        timeout: Timeout in seconds for completion
-
-    Returns:
-        Dictionary with model names as keys and (call_price, put_price) tuples as values
+    Price every contract of one date from a single path set.
+    Returns (prices, standard_errors); the SE uses antithetic-pair averages.
     """
-    results = {}
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all pricing tasks
-        future_to_model = {
-            executor.submit(_calculate_bs_price_worker, S0, K, r, volatility, T, num_paths): 'BS',
-            executor.submit(_calculate_mmar_price_worker, S0, K, r, T, hurst, num_paths): 'MMAR',
-            executor.submit(_calculate_heston_price_worker, S0, K, r, T, heston_params, num_paths): 'Heston',
-            executor.submit(_calculate_merton_price_worker, S0, K, r, T, merton_params, num_paths, volatility): 'Merton',
-            executor.submit(_calculate_bates_price_worker, S0, K, r, T, heston_params, merton_params, num_paths): 'Bates',
-        }
-
-        # Collect results as they complete
-        for future in as_completed(future_to_model, timeout=timeout):
-            model_name, (call_price, put_price) = future.result()
-            results[model_name] = {
-                'call': float(call_price) if not np.isnan(call_price) else None,
-                'put': float(put_price) if not np.isnan(put_price) else None
-            }
-
-    return results
+    K = np.asarray(K, dtype=float)
+    T = np.asarray(T, dtype=float)
+    rng = np.random.default_rng(seed)
+    grid = _simulation_grid(T)
+    log_paths = simulate_log_paths(model, params, S0, r, q, grid, n_paths, rng)
+    idx = np.searchsorted(grid, T)
+    S_T = np.exp(log_paths[idx])                                  # (C, n)
+    payoff = np.where(is_call[:, None], np.maximum(S_T - K[:, None], 0.0),
+                      np.maximum(K[:, None] - S_T, 0.0))
+    half = payoff.shape[1] // 2
+    pair = 0.5 * (payoff[:, :half] + payoff[:, half:])
+    disc = np.exp(-r * T)
+    prices = disc * pair.mean(axis=1)
+    se = disc * pair.std(axis=1, ddof=1) / math.sqrt(half)
+    return prices, se
 
 
-def bs_delta(S, K, r, sigma, T, option_type='call'):
+# ---------------------------------------------------------------------------
+# Multifractal Model of Asset Returns: X(t) = B_H(θ(t)), conditional MC
+# ---------------------------------------------------------------------------
+
+def draw_cascade_normals(n_draws: int, rng) -> np.ndarray:
+    """
+    Standard normals driving the cascade multipliers: 2 per node over
+    CASCADE_LEVELS levels. Drawn as antithetic pairs (rows z and −z).
+    """
+    half = n_draws // 2
+    z = rng.standard_normal((half, 2 * (CASCADE_CELLS - 1)))
+    return np.concatenate([z, -z])
+
+
+def cascade_cell_masses(z: np.ndarray, cascade_sigma: float) -> np.ndarray:
+    """
+    Microcanonical lognormal cascade: at every node the mass splits between
+    its two children in proportions M_i / (M_0 + M_1), ln M_i = s·Z_i. Returns
+    (n_draws, CASCADE_CELLS) leaf masses, each row summing to 1; by symmetry
+    each leaf has expected mass 1/CASCADE_CELLS.
+    """
+    n = z.shape[0]
+    masses = np.ones((n, 1))
+    offset = 0
+    for level in range(CASCADE_LEVELS):
+        m = 2 ** level
+        w = np.exp(cascade_sigma * z[:, offset:offset + 2 * m].reshape(n, m, 2))
+        offset += 2 * m
+        w = w / w.sum(axis=2, keepdims=True)
+        masses = (masses[:, :, None] * w).reshape(n, 2 * m)
+    return masses
+
+
+def mmar_trading_time(T: np.ndarray, masses: np.ndarray) -> np.ndarray:
+    """
+    θ(T) in years for each maturity in T (years): cumulative cascade mass up
+    to calendar position T·252 trading days, with linear interpolation within
+    a cell, scaled so E[θ(T)] = T. Returns (len(T), n_draws).
+    """
+    cum = np.concatenate([np.zeros((masses.shape[0], 1)), np.cumsum(masses, axis=1)], axis=1)
+    cum *= CASCADE_CELLS / TRADING_DAYS_PER_YEAR
+    pos = np.clip(np.asarray(T, dtype=float) * TRADING_DAYS_PER_YEAR, 0.0, CASCADE_CELLS)
+    j = np.minimum(np.floor(pos).astype(int), CASCADE_CELLS - 1)
+    frac = pos - j
+    return (cum[:, j] + frac[None, :] * (cum[:, j + 1] - cum[:, j])).T
+
+
+def mmar_price_vec(S: float, K: np.ndarray, T: np.ndarray, r: float, q: float,
+                   sigma: float, hurst: float, cascade_sigma: float,
+                   is_call: np.ndarray, z: np.ndarray) -> np.ndarray:
+    """
+    MMAR European option price by conditional Monte Carlo.
+
+    X(t) = ln S_t − ln S_0 − drift = σ·B_H(θ(t)), with B_H a fractional
+    Brownian motion independent of the cascade trading time θ. Because a
+    European payoff depends only on S_T and B_H is H-self-similar, conditional
+    on θ(T) = u the log-price is exactly Gaussian with variance σ² u^{2H}; no
+    path of B_H needs to be simulated. The drift is set so that, conditionally
+    on u, E[S_T | u] = S e^{(r−q)T} (forward/martingale normalisation), so each
+    conditional price is a Black-Scholes price with total standard deviation
+    σ u^H, and the MMAR price is its average over the cascade draws `z`.
+
+    Reduces to Black-Scholes(σ) when H = ½ and cascade_sigma = 0.
+    """
+    K = np.asarray(K, dtype=float)
+    T = np.asarray(T, dtype=float)
+    is_call = np.asarray(is_call, dtype=bool)
+    T_u, inv = np.unique(T, return_inverse=True)
+    masses = cascade_cell_masses(z, cascade_sigma)
+    theta = mmar_trading_time(T_u, masses)                        # (U, n)
+    total_sd = sigma * np.power(np.maximum(theta, 1e-12), hurst)  # (U, n)
+    prices = np.empty(len(K))
+    for u_idx in range(len(T_u)):
+        sel = inv == u_idx
+        p = _bs_price_matrix(S, K[sel], T_u[u_idx], r, q, total_sd[u_idx], is_call[sel])
+        prices[sel] = p.mean(axis=1)
+    return prices
+
+
+def _bs_price_matrix(S: float, K: np.ndarray, T: float, r: float, q: float,
+                     total_sd: np.ndarray, is_call: np.ndarray) -> np.ndarray:
+    """BS prices for contracts K (C,) at one maturity across draws total_sd (n,) → (C, n)."""
+    fwd = S * math.exp((r - q) * T)
+    sd = total_sd[None, :]
+    lnFK = np.log(fwd / K)[:, None]
+    d1 = lnFK / sd + 0.5 * sd
+    d2 = d1 - sd
+    disc = math.exp(-r * T)
+    call = disc * (fwd * ndtr(d1) - K[:, None] * ndtr(d2))
+    put = call - disc * (fwd - K[:, None])
+    return np.where(is_call[:, None], call, put)
+
+
+# ---------------------------------------------------------------------------
+# Black-Scholes Greeks (hedging and the strategy-selector target)
+# ---------------------------------------------------------------------------
+
+def bs_delta(S, K, r, sigma, T, option_type='call', q=0.0):
     """
     Black-Scholes delta. Used as the universal hedge ratio across all pricing models.
 
@@ -602,6 +380,7 @@ def bs_delta(S, K, r, sigma, T, option_type='call'):
         sigma: Annualized volatility
         T: Time to maturity in years
         option_type: 'call' or 'put'
+        q: Continuous dividend yield
 
     Returns:
         Delta in [-1, 1]. Positive for calls, negative for puts.
@@ -610,7 +389,22 @@ def bs_delta(S, K, r, sigma, T, option_type='call'):
         if option_type == 'call':
             return 1.0 if S >= K else 0.0
         return -1.0 if S <= K else 0.0
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    disc_q = math.exp(-q * T)
     if option_type == 'call':
-        return float(norm.cdf(d1))
-    return float(norm.cdf(d1) - 1.0)
+        return float(disc_q * norm.cdf(d1))
+    return float(disc_q * (norm.cdf(d1) - 1.0))
+
+
+def bs_theta(S, K, r, sigma, T, option_type='call', q=0.0):
+    """Black-Scholes theta per year (∂V/∂t, negative for a decaying long option)."""
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    sqrt_T = math.sqrt(T)
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * sqrt_T)
+    d2 = d1 - sigma * sqrt_T
+    disc_q, disc_r = math.exp(-q * T), math.exp(-r * T)
+    decay = -S * disc_q * norm.pdf(d1) * sigma / (2.0 * sqrt_T)
+    if option_type == 'call':
+        return float(decay - r * K * disc_r * norm.cdf(d2) + q * S * disc_q * norm.cdf(d1))
+    return float(decay + r * K * disc_r * norm.cdf(-d2) - q * S * disc_q * norm.cdf(-d1))

@@ -22,7 +22,7 @@ from metrics import (
 # Constants
 # ---------------------------------------------------------------------------
 
-OUTPUT_DIR = pathlib.Path('/app/output')
+OUTPUT_DIR = pathlib.Path(__file__).parent / 'output'
 
 _STRATEGY_DISPLAY: dict = {
     'BuyAndHoldStrategy':    'Buy & Hold',
@@ -66,7 +66,13 @@ def generate_visualizations(
     gbr_meta_train_rmse: Optional[float],
     strategy_selector_importances: Optional[dict],
     portfolio_metrics: dict,
+    gbr_oos_rmse: Optional[float] = None,
+    gbr_oos_mae: Optional[float] = None,
+    gbr_oos_n: Optional[int] = None,
+    mmar_calibration_summary: Optional[dict] = None,
+    mmar_protocol_dm_test: Optional[dict] = None,
     output_dir: pathlib.Path = OUTPUT_DIR,
+    extra_summary: Optional[dict] = None,
 ) -> None:
     """
     Generate the full end-of-run chart suite and summary files.
@@ -99,27 +105,39 @@ def generate_visualizations(
     rets = np.array(weekly_returns, dtype=float)
     spy_weekly = _compute_spy_weekly(spy_prices, curve_df.index)
 
-    _safe_chart(_chart_equity_curve, curve_df, spy_weekly, portfolio_metrics, output_dir)
-    _safe_chart(_chart_drawdown, curve_df, spy_weekly, output_dir)
-    _safe_chart(_chart_rolling_sharpe, rets, curve_df.index, output_dir)
-    _safe_chart(_chart_return_distribution, rets, portfolio_metrics, output_dir)
-    _safe_chart(_chart_monthly_heatmap, curve_df, output_dir)
+    _safe_chart(_chart_equity_curve, curve_df, spy_weekly, portfolio_metrics, output_dir,
+                output_dir=output_dir, expected_file='01_equity_curve.png')
+    _safe_chart(_chart_drawdown, curve_df, spy_weekly, output_dir,
+                output_dir=output_dir, expected_file='02_drawdown.png')
+    _safe_chart(_chart_rolling_sharpe, rets, curve_df.index, output_dir,
+                output_dir=output_dir, expected_file='03_rolling_sharpe.png')
+    _safe_chart(_chart_return_distribution, rets, portfolio_metrics, output_dir,
+                output_dir=output_dir, expected_file='04_return_distribution.png')
+    _safe_chart(_chart_monthly_heatmap, curve_df, output_dir,
+                output_dir=output_dir, expected_file='05_monthly_heatmap.png')
 
     if model_accuracy_metrics:
-        _safe_chart(_chart_model_performance, model_accuracy_metrics, dm_results, output_dir)
+        _safe_chart(_chart_model_performance, model_accuracy_metrics, dm_results, output_dir,
+                    output_dir=output_dir, expected_file='06_model_performance.png')
 
-    _safe_chart(_chart_strategy_allocation, curve_df, output_dir)
+    _safe_chart(_chart_strategy_allocation, curve_df, output_dir,
+                output_dir=output_dir, expected_file='07_strategy_allocation.png')
 
     if 'notional_exposure' in curve_df.columns:
-        _safe_chart(_chart_notional_exposure, curve_df, output_dir)
+        _safe_chart(_chart_notional_exposure, curve_df, output_dir,
+                    output_dir=output_dir, expected_file='08_notional_exposure.png')
 
     if gbr_meta_importances or strategy_selector_importances:
         _safe_chart(_chart_gbr_importance,
             gbr_meta_importances, gbr_meta_train_rmse,
             strategy_selector_importances, output_dir,
+            gbr_oos_rmse, gbr_oos_mae, gbr_oos_n,
+            output_dir=output_dir, expected_file='09_gbr_importance.png',
         )
 
-    _save_summary_json(portfolio_metrics, model_accuracy_metrics, dm_results, output_dir)
+    _save_summary_json(portfolio_metrics, model_accuracy_metrics, dm_results, output_dir,
+                       gbr_oos_rmse, gbr_oos_mae, gbr_oos_n,
+                       mmar_calibration_summary, mmar_protocol_dm_test, extra_summary)
     _save_equity_csv(curve_df, output_dir)
 
     _print_manifest(output_dir, model_accuracy_metrics,
@@ -408,8 +426,8 @@ def _chart_model_performance(
     ax.set_xticks(x)
     ax.set_xticklabels(models, rotation=20, ha='right')
     ax.set_ylabel('Pricing Error ($)')
-    ax.set_title('RMSE & MAE  (lower = better)\n'
-                 'Dollar-weighted; large errors penalised quadratically by RMSE')
+    ax.set_title('Same-day RMSE & MAE  (lower = better)\n'
+                 'Model price vs day-t market mid (OOS: parameters fitted on t-1)')
     ax.legend(fontsize=9)
     _annotate_bars(ax, b1, '{:.3f}')
     _annotate_bars(ax, b2, '{:.3f}')
@@ -424,8 +442,7 @@ def _chart_model_performance(
     ax.set_xticks(x)
     ax.set_xticklabels(models, rotation=20, ha='right')
     ax.set_ylabel('MAPE (%)')
-    ax.set_title('Mean Absolute % Error  (lower = better)\n'
-                 'Scale-invariant: prevents ATM options dominating error stats')
+    ax.set_title('Mean Absolute % Error  (lower = better)')
     _annotate_bars(ax, b, '{:.1f}%', skip_nan=True)
 
     # ── Directional Accuracy ──────────────────────────────────────────────
@@ -450,15 +467,15 @@ def _chart_model_performance(
     ax.set_xticks(x)
     ax.set_xticklabels(models, rotation=20, ha='right')
     ax.set_ylabel('Pearson Correlation')
-    ax.set_title('Prediction–Realisation Correlation  (higher = better)\n'
-                 'Linear alignment between model price and eventual exit price')
+    ax.set_title('Model–Market Correlation  (higher = better)\n'
+                 'Linear alignment between model price and same-day market mid')
     ax.axhline(0, color='black', linewidth=0.8)
     ax.set_ylim(-1, 1.15)
     _annotate_bars(ax, b, '{:.3f}')
 
     # ── Diebold–Mariano note ──────────────────────────────────────────────
     if dm_results:
-        dm_lines = ['Diebold–Mariano tests (squared-error, vs Black-Scholes):']
+        dm_lines = ['Diebold–Mariano tests (same-day squared error, date-clustered, vs Black-Scholes):']
         for k, v in dm_results.items():
             m = k.replace('_vs_BS', '')
             p = v.get('p_value', 1.0)
@@ -553,6 +570,9 @@ def _chart_gbr_importance(
     meta_train_rmse: Optional[float],
     selector_importances: Optional[dict],
     output_dir: pathlib.Path,
+    oos_rmse: Optional[float] = None,
+    oos_mae: Optional[float] = None,
+    oos_n: Optional[int] = None,
 ) -> None:
     n_panels = (1 if meta_importances else 0) + (1 if selector_importances else 0)
     if n_panels == 0:
@@ -575,9 +595,14 @@ def _chart_gbr_importance(
         ]
         ax.barh(display_labels, vals, color=colors, alpha=0.85)
         ax.set_xlabel('Feature Importance (Gini impurity reduction)')
-        rmse_str = (f'  —  train RMSE: ${meta_train_rmse:.4f}'
-                    if meta_train_rmse is not None else '')
-        ax.set_title(f'Pricing Ensemble GBR{rmse_str}', fontsize=11)
+        train_str = (f'train RMSE: ${meta_train_rmse:.4f}'
+                     if meta_train_rmse is not None else '')
+        oos_str   = ''
+        if oos_rmse is not None and not (oos_rmse != oos_rmse):
+            n_str   = f'  n={oos_n}' if oos_n else ''
+            oos_str = f'   OOS RMSE: ${oos_rmse:.4f}  OOS MAE: ${oos_mae:.4f}{n_str}'
+        rmse_str = f'  —  {train_str}{oos_str}' if (train_str or oos_str) else ''
+        ax.set_title(f'Pricing Ensemble GBR{rmse_str}', fontsize=10)
         # Blue = model price features, orange = market features
         blue_patch  = mpatches.Patch(color='#2980b9', label='Model price inputs')
         orng_patch  = mpatches.Patch(color='#e67e22', label='Market features (vol, moneyness, TTM)')
@@ -606,12 +631,41 @@ def _save_summary_json(
     model_metrics: Optional[dict],
     dm_results: Optional[dict],
     output_dir: pathlib.Path,
+    gbr_oos_rmse: Optional[float] = None,
+    gbr_oos_mae: Optional[float] = None,
+    gbr_oos_n: Optional[int] = None,
+    mmar_calibration_summary: Optional[dict] = None,
+    mmar_protocol_dm_test: Optional[dict] = None,
+    extra_summary: Optional[dict] = None,
 ) -> None:
+    gbr_eval = None
+    if gbr_oos_rmse is not None and not (gbr_oos_rmse != gbr_oos_rmse):
+        gbr_eval = {
+            'oos_rmse': round(gbr_oos_rmse, 6),
+            'oos_mae':  round(gbr_oos_mae, 6) if gbr_oos_mae is not None else None,
+            'oos_n':    gbr_oos_n,
+            'split':    '70/30 temporal (train/test)',
+            'note':     'Production GBR trained on full dataset; OOS RMSE from shadow model on held-out 30%.',
+        }
     summary = {
         'portfolio':      pm,
         'model_accuracy': model_metrics,
         'diebold_mariano': dm_results,
+        'gbr_ensemble_eval': gbr_eval,
+        'mmar_calibration': {
+            'convergence':       mmar_calibration_summary,
+            'protocol_dm_test':  mmar_protocol_dm_test,
+            'note':              ('protocol_dm_test compares the quote-calibrated '
+                                   'MMAR (sigma, H, cascade s fit weekly to the t-1 option '
+                                   'cross-section) against the static-H MMAR (H fixed at the '
+                                   'returns-based partition-function estimate through t-1; '
+                                   'sigma and s still fit to quotes); a negative DM_stat '
+                                   'favors the quote-calibrated specification. DM_stat is '
+                                   'date-clustered; DM_stat_contract is the pooled reference.'),
+        },
     }
+    if extra_summary:
+        summary.update(extra_summary)
 
     def _clean(obj):
         if isinstance(obj, float) and (np.isnan(obj) or np.isinf(obj)):
@@ -678,12 +732,45 @@ def _annotate_bars(
         )
 
 
-def _safe_chart(fn, *args, **kwargs) -> None:
-    """Call a chart function; print a warning on failure rather than crashing."""
+def _safe_chart(
+    fn,
+    *args,
+    output_dir: Optional[pathlib.Path] = None,
+    expected_file: Optional[str] = None,
+    **kwargs,
+) -> None:
+    """
+    Call a chart function; print a warning on failure rather than crashing.
+
+    Several chart functions (rolling Sharpe, monthly heatmap, strategy
+    allocation, model performance, GBR importance) return early with no
+    exception when they don't have enough data for that run — e.g. rolling
+    Sharpe needs >= window+1 weekly-return observations. That early return
+    used to be silent: no warning was printed, and if a PNG from a previous,
+    longer run was already sitting in output_dir, it was left untouched and
+    looked like current output. When `output_dir` and `expected_file` are
+    given, this now checks the file's mtime before and after the call and
+    warns if it was not (re)written this run.
+    """
+    target = (output_dir / expected_file) if (output_dir and expected_file) else None
+    mtime_before = target.stat().st_mtime if (target is not None and target.exists()) else None
+
     try:
         fn(*args, **kwargs)
     except Exception as exc:
         print(f'[VIZ] WARNING: {fn.__name__} failed — {exc}')
+        return
+
+    if target is None:
+        return
+    mtime_after = target.stat().st_mtime if target.exists() else None
+    if mtime_after is None:
+        print(f'[VIZ] WARNING: {fn.__name__} did not write {expected_file} '
+              f'this run (likely insufficient data) — no file was produced.')
+    elif mtime_before is not None and mtime_after == mtime_before:
+        print(f'[VIZ] WARNING: {fn.__name__} skipped plotting {expected_file} '
+              f'this run (likely insufficient data) — the file present is '
+              f'stale, left over from a previous run.')
 
 
 def _print_manifest(
@@ -705,6 +792,8 @@ def _print_manifest(
         '09_gbr_importance.png',
         'backtest_summary.json',
         'equity_curve.csv',
+        'bucketed_model_errors.csv',
+        'mmar_calibration_history.csv',
     ]
     for f in candidates:
         if (output_dir / f).exists():

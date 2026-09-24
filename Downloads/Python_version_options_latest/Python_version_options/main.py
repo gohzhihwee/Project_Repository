@@ -3,7 +3,8 @@ from models import *
 from modelstrats import *
 from convmethods import *
 from ensemble import *
-from data_loader import DatabentoCacheLoader
+from data_loader import DatabentoCacheLoader, _parse_osi_symbol
+from calibration import stratified_sample, EVAL_MONEYNESS_EDGES
 
 import os
 import pathlib
@@ -12,12 +13,21 @@ load_dotenv()
 import numpy as np
 import pandas as pd
 import datetime
+import time
 from scipy.stats import norm
 from concurrent.futures import ThreadPoolExecutor
 
-OUTPUT_DIR = pathlib.Path('/app/output')
+OUTPUT_DIR = pathlib.Path(__file__).parent / 'output'
 CACHE_DIR  = pathlib.Path(__file__).parent / 'option_cache'
 CSV_DIR    = pathlib.Path(__file__).parent / 'options_data'  # drop Databento CSV exports here
+
+UNDERLYING_TICKER = 'SPY'
+# Prevailing short-dated Treasury yield over the sample (paper §3.2).
+RISK_FREE_RATE = 0.052
+# Evaluation universe per rebalance: this many contracts from each of the
+# 5 K/S bands × 2 maturity buckets (7–30, 31–90 days) → 150 contracts.
+EVAL_CONTRACTS_PER_CELL = 15
+EVAL_MIN_DTE, EVAL_MAX_DTE = 7, 90
 
 # ---------------------------------------------------------------------------
 # Shim data-structures that mirror the QC runtime API
@@ -222,14 +232,26 @@ class OptionsArbitrageAlgorithm:
     # ==== entry point ======================================================
 
     def run_backtest(self):
+        self._wall_t0 = time.perf_counter()
         print("Downloading SPY daily data via yfinance …")
         import yfinance as yf
         
-        raw = yf.download("SPY", start="2021-06-01", end="2024-09-01",
-                          progress=False, auto_adjust=True)
+        # Two series: the UNADJUSTED close is the tradable spot used for option
+        # pricing, moneyness and settlement; the dividend-ADJUSTED close is used
+        # only for return-based quantities (realized vol, Merton MLE, returns-H,
+        # regime features, the SPY total-return benchmark). Adjusted closes are
+        # back-adjusted for every dividend up to the download date and were
+        # 2.5–3.9% below the traded price over this sample.
+        raw = yf.download(UNDERLYING_TICKER, start="2021-06-01", end="2024-09-01",
+                          progress=False, auto_adjust=False)
         raw.index = pd.to_datetime(raw.index).normalize()
-        self._all_prices = raw[['Close']].rename(columns={'Close': 'SPY'})
-        print(f"  {len(self._all_prices)} daily bars loaded.")
+        close = raw['Close'].squeeze()
+        adj_close = raw['Adj Close'].squeeze()
+        self._all_prices = pd.DataFrame({'SPY': close, 'SPY_TR': adj_close})
+        divs = yf.Ticker(UNDERLYING_TICKER).dividends
+        divs.index = pd.to_datetime(divs.index).tz_localize(None).normalize()
+        self._dividends = divs
+        print(f"  {len(self._all_prices)} daily bars loaded; {len(divs)} dividend records.")
         using_real_data = bool(os.environ.get('DATABENTO_API_KEY', '').strip())
         print(f"  Options data source: {'Databento (real)' if using_real_data else 'synthetic (fallback — set DATABENTO_API_KEY for real data)'}")
 
@@ -262,6 +284,7 @@ class OptionsArbitrageAlgorithm:
             spy_price = float(row['SPY'].iloc[0])
             self._securities.update({'SPY': spy_price,
                                      self._underlying_symbol: spy_price})
+            self._settle_expired_positions(sim_date, spy_price)
             if day_idx % 10 == 0:
                 print(f"[{sim_date}] Day {day_idx + 1}/{n_days}  "
                       f"SPY ${spy_price:.2f}  "
@@ -270,6 +293,7 @@ class OptionsArbitrageAlgorithm:
             
             chain, calib_df = self._load_option_chain(spy_price, sim_date)
             self._current_slice.option_chains._set(self._option_symbol, chain)
+            self._today_calib_df = calib_df
             # _prev_calib_df intentionally NOT updated yet: it still holds
             # yesterday's cross-section so _calibrate_model_params (called
             # inside _rebalance) calibrates on t-1 and evaluates OOS on t.
@@ -311,6 +335,7 @@ class OptionsArbitrageAlgorithm:
             # uses today's cross-section (genuine out-of-sample protocol).
             self._prev_calib_df = calib_df
             self._prev_spot     = spy_price
+            self._prev_date     = sim_date
 
         self._print_summary()
         self._generate_output()
@@ -320,10 +345,10 @@ class OptionsArbitrageAlgorithm:
     def _generate_option_chain(self, spot, current_date):
 
         hist = self._all_prices[self._all_prices.index.date <= current_date]  # type: ignore
-        log_rets = np.log(hist['SPY'].pct_change() + 1).dropna()
+        log_rets = np.log(hist['SPY_TR'].pct_change() + 1).dropna()
         sigma = float(log_rets.tail(20).std() * np.sqrt(252)) if len(log_rets) >= 5 else 0.20
         sigma = max(sigma, 0.05)
-        r = 0.052
+        r = RISK_FREE_RATE
 
         atm      = round(spot / 5.0) * 5.0
         strikes  = [atm + i * 5.0 for i in range(-2, 3)]
@@ -397,45 +422,157 @@ class OptionsArbitrageAlgorithm:
         curve_df['date'] = pd.to_datetime(curve_df['date'])
         curve_df = curve_df.set_index('date')
 
+        # Weekly portfolio returns for all reported risk/return metrics (Sharpe,
+        # Sortino, VaR/CVaR, alpha/beta, rolling Sharpe, the return-distribution
+        # chart) — derived from the same post-trade equity curve that CAGR,
+        # total_return, max drawdown and the equity-curve/drawdown charts use,
+        # so every reported number traces back to one consistent series.
+        # self._all_weekly_returns is a *different*, pre-trade series (mark-to-
+        # market of the prior week's book, measured before that week's own
+        # trades execute) used causally during the walk-forward loop for
+        # regime classification (_regime_returns) — that's a legitimate,
+        # separate purpose and is intentionally left untouched here.
+        equity_weekly_rets = curve_df['value'].pct_change().dropna().tolist()
+
         # SPY weekly returns aligned to rebalance dates for alpha/beta
         spy_weekly_rets = None
         try:
             ec_dates = pd.to_datetime([r['date'] for r in self._equity_curve])
-            spy_at_dates = self._all_prices['SPY'].reindex(ec_dates, method='ffill').dropna()
+            spy_at_dates = self._all_prices['SPY_TR'].reindex(ec_dates, method='ffill').dropna()
             spy_weekly_rets = spy_at_dates.pct_change().dropna()
         except Exception as e:
             self.debug(f"SPY benchmark alignment failed: {e}")
 
         pm = compute_portfolio_metrics(
             equity_curve=curve_df,
-            weekly_returns=self._all_weekly_returns,
+            weekly_returns=equity_weekly_rets,
             trade_log=self._trade_log,
             spy_returns=spy_weekly_rets,
             initial_capital=100_000.0,
+            risk_free_rate=RISK_FREE_RATE,
         )
         self.debug(f"Portfolio metrics: {pm}")
 
         tracker      = self._price_calculator.get_performance_tracker()
         model_metrics = tracker.get_model_accuracy_metrics()
-        dm_results    = tracker.run_diebold_mariano_tests()
+        dm_results    = tracker.run_diebold_mariano_tests('same_day')
+        dm_next       = tracker.run_diebold_mariano_tests('next_week')
+
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        bucketed_df = tracker.compute_bucketed_metrics()
+        if bucketed_df is not None:
+            out_path = OUTPUT_DIR / 'bucketed_model_errors.csv'
+            bucketed_df.to_csv(out_path, index=False)
+            self.debug(f"[OUTPUT] Bucketed metrics written → {out_path}  ({len(bucketed_df)} rows)")
+        else:
+            self.debug("[OUTPUT] Bucketed metrics: insufficient data, CSV not written.")
+
+        pred_df = tracker.get_prediction_dataframe()
+        if pred_df is not None:
+            pred_df.to_csv(OUTPUT_DIR / 'predictions.csv', index=False)
+        if model_metrics:
+            metrics_df = pd.DataFrame(model_metrics).T
+            metrics_df.index.name = 'model'
+            same_cols = ['RMSE', 'MAE', 'MAPE', 'MedAPE', 'Correlation', 'Sample_Size', 'n_dates']
+            next_cols = ['RMSE_next', 'MAE_next', 'Correlation_next', 'Directional_Accuracy', 'Sample_Size_next']
+            metrics_df[[c for c in same_cols if c in metrics_df]].join(
+                pd.DataFrame(dm_results or {}).T.rename(index=lambda k: k.split('_vs_')[0]).add_prefix('dm_'), how='left'
+            ).to_csv(OUTPUT_DIR / 'model_errors_sameday.csv')
+            metrics_df[[c for c in next_cols if c in metrics_df]].join(
+                pd.DataFrame(dm_next or {}).T.rename(index=lambda k: k.split('_vs_')[0]).add_prefix('dm_'), how='left'
+            ).to_csv(OUTPUT_DIR / 'model_errors_nextweek.csv')
 
         pc = self._price_calculator
+        mmar_hist_df = pc.get_mmar_calibration_history_df()
+        if mmar_hist_df is not None:
+            mmar_hist_df.to_csv(OUTPUT_DIR / 'mmar_calibration_history.csv', index=False)
+            self.debug(f"[OUTPUT] MMAR calibration history written ({len(mmar_hist_df)} dates)")
+        for name, frame in (('calibration_log.csv', pc.get_calibration_log_df()),
+                            ('calibration_params.csv', pc.get_param_log_df()),
+                            ('mc_convergence_log.csv', pc.get_mc_check_log_df()),
+                            ('dm_pairwise_sameday.csv', tracker.run_pairwise_dm_tests('same_day')),
+                            ('dm_pairwise_nextweek.csv', tracker.run_pairwise_dm_tests('next_week'))):
+            if frame is not None:
+                frame.to_csv(OUTPUT_DIR / name, index=False)
+
+        # MMAR calibration-protocol diagnostics: convergence count and the DM
+        # test of the quote-calibrated MMAR against the static-H MMAR.
+        mmar_calib_summary = pc.get_mmar_calibration_summary()
+        mmar_protocol_dm   = tracker.run_mmar_calibration_protocol_dm_test('same_day')
+        mmar_protocol_dm_next = tracker.run_mmar_calibration_protocol_dm_test('next_week')
+        event_counts = self._event_counts(pred_df)
+        # Figure 4 and the headline JSON keys show the Monte Carlo (reported)
+        # prices; the closed-form robustness rows are stored separately.
+        mc_metrics = {k: v for k, v in (model_metrics or {}).items() if k not in CLOSED_FORM_MODELS} or None
+        cf_metrics = {k: v for k, v in (model_metrics or {}).items() if k in CLOSED_FORM_MODELS} or None
+        mc_dm = {k: v for k, v in (dm_results or {}).items() if not k.endswith('_vs_BS_CF')} or None
+        cf_dm = {k: v for k, v in (dm_results or {}).items() if k.endswith('_vs_BS_CF')} or None
+        self.debug(f"[OUTPUT] Event counts: {event_counts}")
+        if mmar_calib_summary is not None:
+            self.debug(
+                f"[MMAR] Calibration convergence: "
+                f"{mmar_calib_summary['n_converged']} of {mmar_calib_summary['n_dates']} dates converged  "
+                f"(H median={mmar_calib_summary['hurst_median']}, SD={mmar_calib_summary['hurst_std']})"
+            )
+        if mmar_protocol_dm is not None:
+            self.debug(
+                f"[MMAR] Quote-calibrated vs static-H DM test: "
+                f"stat={mmar_protocol_dm['DM_stat']}  p={mmar_protocol_dm['p_value']}  "
+                f"favors={mmar_protocol_dm['favors']}  n={mmar_protocol_dm['n']}"
+            )
         ss = self._strategy_selector
 
+        _nan = float('nan')
         generate_visualizations(
             equity_curve=self._equity_curve,
-            weekly_returns=self._all_weekly_returns,
-            spy_prices=self._all_prices,
-            model_accuracy_metrics=model_metrics,
-            dm_results=dm_results,
+            weekly_returns=equity_weekly_rets,
+            spy_prices=self._all_prices[['SPY_TR']].rename(columns={'SPY_TR': 'SPY'}),
+            model_accuracy_metrics=mc_metrics,
+            dm_results=mc_dm,
             trade_log=self._trade_log,
             gbr_meta_importances=pc._meta_importances if pc._meta_importances else None,
-            gbr_meta_train_rmse=pc._meta_train_rmse if not (
-                pc._meta_train_rmse != pc._meta_train_rmse) else None,  # nan check
+            gbr_meta_train_rmse=pc._meta_train_rmse if pc._meta_train_rmse == pc._meta_train_rmse else None,
             strategy_selector_importances=ss.feature_importances if ss.feature_importances else None,
             portfolio_metrics=pm,
+            gbr_oos_rmse=pc._meta_oos_rmse if pc._meta_oos_rmse == pc._meta_oos_rmse else None,
+            gbr_oos_mae=pc._meta_oos_mae if pc._meta_oos_mae == pc._meta_oos_mae else None,
+            gbr_oos_n=pc._meta_oos_n if pc._meta_oos_n > 0 else None,
+            mmar_calibration_summary=mmar_calib_summary,
+            mmar_protocol_dm_test=mmar_protocol_dm,
             output_dir=OUTPUT_DIR,
+            extra_summary={
+                'scoring_note': ('model_accuracy RMSE/MAE/MAPE/Correlation and diebold_mariano are '
+                                 'same-day OOS pricing errors (model price from t-1 parameters vs '
+                                 'day-t mid). *_next fields and diebold_mariano_next_week are '
+                                 'one-week forecast errors vs the next rebalance mid; contracts not '
+                                 'quoted then are excluded. DM_stat is date-clustered.'),
+                'diebold_mariano_next_week': dm_next,
+                'model_accuracy_closed_form': cf_metrics,
+                'diebold_mariano_closed_form': cf_dm,
+                'mmar_protocol_dm_next_week': mmar_protocol_dm_next,
+                'event_counts': event_counts,
+                'config': {'n_mc_paths': N_MC_PATHS, 'risk_free_rate': RISK_FREE_RATE,
+                           'eval_contracts_per_cell': EVAL_CONTRACTS_PER_CELL,
+                           'eval_moneyness_edges': list(EVAL_MONEYNESS_EDGES)},
+            },
         )
+
+    def _event_counts(self, pred_df) -> dict:
+        """One definitive table of how many dates enter each part of the study."""
+        mondays = pd.date_range(self._start_date, self._end_date, freq='W-MON').date
+        trading = set(self._all_prices.index.date)
+        return {
+            'mondays_in_window':          int(len(mondays)),
+            'monday_market_holidays':     int(sum(1 for d in mondays if d not in trading)),
+            'rebalance_dates':            int(self._n_rebalances),
+            'calibration_attempts':       int(self._n_calibration_attempts),
+            'mmar_calibrations_recorded': int(len(self._price_calculator._mmar_calib_history)),
+            'evaluated_pricing_dates':    int(pred_df['date'].nunique()) if pred_df is not None else 0,
+            'evaluated_contract_dates':   int(len(pred_df)) if pred_df is not None else 0,
+            'next_week_realized':         int(pred_df['realized_price'].notna().sum()) if pred_df is not None else 0,
+            'margin_halted_weeks':        int(self._n_halted_weeks),
+            'strategy_return_weeks':      int(len(self._equity_curve) - 1),
+        }
 
     # ==== QC API shims =====================================================
 
@@ -453,6 +590,14 @@ class OptionsArbitrageAlgorithm:
         )
         self._prev_calib_df = None   # t-1 cross-section for model calibration
         self._prev_spot     = None
+        self._prev_date     = None
+        self._today_calib_df = None  # day-t quoted chain (evaluation + next-week realization)
+        self._last_eval_date = None  # rebalance date of the most recent priced cross-section
+        if not hasattr(self, '_dividends'):
+            self._dividends = pd.Series(dtype=float)
+        self._n_rebalances           = 0
+        self._n_calibration_attempts = 0
+        self._n_halted_weeks         = 0
 
         self._price_history   = pd.DataFrame()
         self._price_calculator = OptionPricingCalculator(self)
@@ -462,7 +607,9 @@ class OptionsArbitrageAlgorithm:
         self._current_slice = CurrentSlice()
         self._current_time  = datetime.datetime.now()
 
-        self._last_calibration_date        = datetime.date(2023, 8, 25)
+        # One week before the first rebalance so that the first evaluated date
+        # (2023-08-28) is already priced from a t−1 calibration.
+        self._last_calibration_date        = datetime.date(2023, 8, 18)
         self._calibration_frequency_days   = 7
         self._min_samples_for_calibration  = 10
 
@@ -512,13 +659,18 @@ class OptionsArbitrageAlgorithm:
         return self._current_time.date() < self._start_date
 
     def debug(self, msg):
-        print(f"[{self._current_time.strftime('%Y-%m-%d %H:%M')}] {msg}")
+        # Simulated time, then wall-clock time elapsed since the run started.
+        elapsed = int(time.perf_counter() - getattr(self, '_wall_t0', time.perf_counter()))
+        h, rem = divmod(elapsed, 3600)
+        print(f"[{self._current_time.strftime('%Y-%m-%d %H:%M')} | +{h:d}:{rem // 60:02d}:{rem % 60:02d}] {msg}",
+              flush=True)
 
     def history(self, symbol, n_bars, resolution=None):
         
         cur = self._current_time.date()
         hist = self._all_prices[self._all_prices.index.date <= cur]  # type: ignore
-        result = hist.tail(n_bars).copy()
+        # Dividend-adjusted closes: every consumer of history() uses returns.
+        result = hist[['SPY_TR']].tail(n_bars).copy()
         result.columns = ['close']
         return result
 
@@ -615,18 +767,28 @@ class OptionsArbitrageAlgorithm:
 
         if self._prev_calib_df is None or self._prev_spot is None:
             return
-        log_rets = np.array([])
-        if (self._price_history is not None
-                and not self._price_history.empty
-                and len(self._price_history) >= 30):
-            log_rets = np.log(
-                self._price_history['SPY'].pct_change() + 1).dropna().values
+        self._n_calibration_attempts += 1
+        # Dividend-adjusted daily log returns strictly before today (through t−1),
+        # expanding window from the start of the downloaded history.
+        adj = self._all_prices['SPY_TR']
+        adj = adj[adj.index.date < self.time.date()]
+        log_rets = np.log(adj).diff().dropna().values
         try:
             self._price_calculator.calibrate_from_cross_section(
-                self._prev_calib_df, self._prev_spot, r=0.052,
-                log_returns=log_rets)
+                self._prev_calib_df, self._prev_spot, r=RISK_FREE_RATE,
+                log_returns=log_rets, q=self._dividend_yield(self._prev_date, self._prev_spot),
+                calib_date=self._prev_date)
         except Exception as e:
             self.debug(f"Model calibration error: {e}")
+
+    def _dividend_yield(self, date: datetime.date, spot: float) -> float:
+        """Trailing-12-month cash dividends (ex-dates ≤ date) / unadjusted spot."""
+        if self._dividends is None or len(self._dividends) == 0 or not spot:
+            return 0.0
+        end = pd.Timestamp(date)
+        window = self._dividends[(self._dividends.index > end - pd.Timedelta(days=365))
+                                 & (self._dividends.index <= end)]
+        return float(window.sum() / spot)
 
     # ==== All existing algorithm methods (unchanged from QC version) =======
 
@@ -660,16 +822,58 @@ class OptionsArbitrageAlgorithm:
             return abs(qty), exit_price
         return 0, 0.0
 
-    def _days_to_expiry(self, symbol_str: str) -> int:
-
+    @staticmethod
+    def _parse_contract(symbol_str: str):
+        """
+        (option_type, strike, expiry_date) from an OSI symbol such as
+        'SPY   231020P00425000' (Databento), or from the synthetic warm-up
+        format 'SPY 231020 P00425'. Returns None if unparseable.
+        """
+        parsed = _parse_osi_symbol(str(symbol_str))
+        if parsed is not None:
+            _, expiry, option_type, strike = parsed
+            return option_type, strike, expiry
+        parts = str(symbol_str).split()
         try:
-            parts = str(symbol_str).split()
-            if len(parts) >= 2:
-                expiry = datetime.datetime.strptime(parts[1], '%y%m%d').date()
-                return max((expiry - self.time.date()).days, 0)
+            expiry = datetime.datetime.strptime(parts[1], '%y%m%d').date()
+            return ('call' if parts[2][0] == 'C' else 'put'), float(parts[2][1:]), expiry
         except (ValueError, IndexError):
-            pass
-        return 999
+            return None
+
+    def _days_to_expiry(self, symbol_str: str) -> int:
+        parsed = self._parse_contract(symbol_str)
+        if parsed is None:
+            return 999
+        return max((parsed[2] - self.time.date()).days, 0)
+
+    def _settle_expired_positions(self, date: datetime.date, spot: float) -> None:
+        """
+        Cash-settle every held option whose expiry is on or before `date` at
+        intrinsic value against the unadjusted close on its expiry date (SPY
+        options are physically settled; intrinsic value is the equivalent
+        exercise value for an ITM contract and zero otherwise).
+        """
+        for sym in list(self._portfolio._positions.keys()):
+            parsed = self._parse_contract(sym)
+            if parsed is None or parsed[2] > date:
+                continue
+            option_type, strike, expiry = parsed
+            closes = self._all_prices['SPY'][self._all_prices.index.date <= expiry]
+            s_exp = float(closes.iloc[-1]) if len(closes) else spot
+            intrinsic = max(s_exp - strike, 0.0) if option_type == 'call' else max(strike - s_exp, 0.0)
+            pos = self._portfolio._positions.pop(sym)
+            self._portfolio._cash += pos.quantity * intrinsic * 100
+            self._portfolio._prices.pop(sym, None)
+            self._trade_log.append({
+                'date':        date,
+                'contract':    sym,
+                'qty':         pos.quantity,
+                'entry_price': pos.average_price,
+                'exit_price':  intrinsic,
+                'pnl':         (intrinsic - pos.average_price) * pos.quantity * 100,
+                'settled':     True,
+            })
+            self.debug(f"SETTLED {pos.quantity} {sym} at expiry, intrinsic ${intrinsic:.2f} (S={s_exp:.2f})")
 
     def _selective_close_positions(self):
 
@@ -677,7 +881,6 @@ class OptionsArbitrageAlgorithm:
         STOP_LOSS    = -0.80   # close if option lost 80%
         DTE_CUTOFF   = 3
 
-        tracker = self._price_calculator.get_performance_tracker()
         for symbol in list(self.portfolio.keys()):
             pos = self.portfolio[symbol]
             if not pos.invested:
@@ -691,9 +894,7 @@ class OptionsArbitrageAlgorithm:
             pct       = (cur_price - avg_entry) / avg_entry
             should_close = dte <= DTE_CUTOFF or pct >= TAKE_PROFIT or pct <= STOP_LOSS
             if should_close:
-                qty_closed, exit_px = self._close_position_with_log(symbol)
-                if qty_closed > 0:
-                    tracker.record_realization(str(symbol), exit_px)
+                self._close_position_with_log(symbol)
 
     def _option_filter(self, universe):
         return universe.strikes(-2, 2).expiration(14, 21)
@@ -725,60 +926,69 @@ class OptionsArbitrageAlgorithm:
             return None
         return pd.DataFrame(contracts)
 
-    def _prepare_option_data(self, chain, precomputed_hurst=0.5):
-        current_price = self.securities[self._underlying_symbol].price
-        current_time  = self.time
-        n_total  = len(chain)
+    def _select_evaluation_universe(self, chain_df: pd.DataFrame, spot: float) -> pd.DataFrame:
+        """
+        Stratified OOS evaluation sample for one rebalance date: up to
+        EVAL_CONTRACTS_PER_CELL contracts from each K/S band (0.85–1.15) ×
+        maturity bucket (7–30, 31–90 days), seeded by the date.
+        """
+        today = self.time.date()
+        df = chain_df.copy()
+        days = df['expiry'].map(lambda e: (e - today).days)
+        df = df[(days >= EVAL_MIN_DTE) & (days <= EVAL_MAX_DTE)
+                & (df['bid_price'] > 0) & (df['ask_price'] >= df['bid_price'])]
+        df['ttm'] = days[df.index] / 365.25
+        return stratified_sample(df, spot, EVAL_CONTRACTS_PER_CELL,
+                                 seed=int(today.strftime('%Y%m%d')),
+                                 moneyness_edges=EVAL_MONEYNESS_EDGES)
+
+    def _prepare_option_data(self, universe_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Price the day-t evaluation universe under every model (parameters from
+        t−1), record each contract-date for OOS scoring, and return the
+        prepared-options table the trading strategies consume.
+        """
+        spot = float(self.securities[self._underlying_symbol].price)
+        q = self._dividend_yield(self.time.date(), spot)
+        prices = self._price_calculator.calculate_model_prices_batch(
+            universe_df, spot, RISK_FREE_RATE, q, self.time)
+        tracker = self._price_calculator.get_performance_tracker()
         prepared = []
-        for idx, (_, row) in enumerate(chain.iterrows()):
-            if idx % 25 == 0:
-                self.debug(f"  Pricing {idx + 1}/{n_total} contracts …")
-            option_type = 'call' if row['right'] == OptionRight.CALL else 'put'
-            mid_price   = ((row['bid'] + row['ask']) / 2
-                           if row['ask'] > 0 else row['last'])
-            if mid_price <= 0:
-                continue
-            model_prices = self._price_calculator.calculate_model_prices(
-                current_price, row['strike'], row['expiry'],
-                current_time, num_paths=50, hurst=precomputed_hurst)
-            current_spot    = float(current_price)
-            option_ttm      = max((row['expiry'].date() - current_time.date()).days / 365.25, 0.001)
-            option_moneyness = float(row['strike']) / current_spot if current_spot > 0 else 1.0
-            self._price_calculator.get_performance_tracker().record_prediction(
-                timestamp=current_time,
-                contract_symbol=str(row['symbol']),
+        for i, row in universe_df.iterrows():
+            option_type = row['option_type']
+            cp = 'Call' if option_type == 'call' else 'Put'
+            mid_price = float(row['mid_price'])
+            model_prices = {f'{PRICE_LABELS[m]} {cp}': (None if pd.isna(prices.at[i, m]) else float(prices.at[i, m]))
+                            for m in MODEL_COLUMNS}
+            moneyness = float(row['strike']) / spot
+            tracker.record_prediction(
+                timestamp=self.time,
+                contract_symbol=str(row['contract_symbol']),
                 strike=row['strike'],
                 expiry=row['expiry'],
                 option_type=option_type,
                 model_prices_dict=model_prices,
                 actual_price=mid_price,
                 volatility=self._price_calculator._last_volatility,
-                moneyness=option_moneyness,
-                ttm=option_ttm,
+                moneyness=moneyness,
+                ttm=float(row['ttm']),
+                spot=spot,
+                dividend_yield=q,
             )
-            spread_cost = self._compute_spread_cost(mid_price, option_moneyness, option_ttm)
             record = {
-                'contract_symbol': str(row['symbol']),
+                'contract_symbol': str(row['contract_symbol']),
                 'Model Strike':    row['strike'],
                 'Expiration Date': row['expiry'].strftime('%Y-%m-%d'),
                 'option_type':     option_type,
-                'spread_cost':     spread_cost,
+                'spread_cost':     self._compute_spread_cost(mid_price, moneyness, float(row['ttm'])),
                 'Actual Call Price': mid_price if option_type == 'call' else None,
                 'Actual Put Price':  mid_price if option_type == 'put'  else None,
-                'MMAR Call':   model_prices.get('MMAR Call')   if option_type == 'call' else None,
-                'MMAR Put':    model_prices.get('MMAR Put')    if option_type == 'put'  else None,
-                'BS Call':     model_prices.get('BS Call')     if option_type == 'call' else None,
-                'BS Put':      model_prices.get('BS Put')      if option_type == 'put'  else None,
-                'Merton Call': model_prices.get('Merton Call') if option_type == 'call' else None,
-                'Merton Put':  model_prices.get('Merton Put')  if option_type == 'put'  else None,
-                'Heston Call': model_prices.get('Heston Call') if option_type == 'call' else None,
-                'Heston Put':  model_prices.get('Heston Put')  if option_type == 'put'  else None,
-                'Bates Call':  model_prices.get('Bates Call')  if option_type == 'call' else None,
-                'Bates Put':   model_prices.get('Bates Put')   if option_type == 'put'  else None,
-                'Mixed Call':  model_prices.get('Mixed Call')  if option_type == 'call' else None,
-                'Mixed Put':   model_prices.get('Mixed Put')   if option_type == 'put'  else None,
             }
+            for m in MODEL_COLUMNS:
+                for side in ('Call', 'Put'):
+                    record[f'{PRICE_LABELS[m]} {side}'] = model_prices[f'{PRICE_LABELS[m]} {cp}'] if side == cp else None
             prepared.append(record)
+        self._last_eval_date = self.time.date()
         return pd.DataFrame(prepared)
 
     MAX_CONCURRENT_POSITIONS = 6
@@ -824,8 +1034,6 @@ class OptionsArbitrageAlgorithm:
             if pos.invested and pos.quantity > 0:
                 # Close the long that is now deemed overpriced
                 exit_price = float(self.securities[symbol].price)
-                self._price_calculator.get_performance_tracker().record_realization(
-                    contract_symbol_str, exit_price)
                 qty_sold, _ = self._close_position_with_log(symbol)
                 if qty_sold > 0:
                     self.debug(f"CLOSED LONG (overpriced) {qty_sold} {symbol} @ ${exit_price:.2f}")
@@ -853,8 +1061,6 @@ class OptionsArbitrageAlgorithm:
         elif signal['type'] == 'sell':
             if self.portfolio[symbol].invested:
                 exit_price = float(self.securities[symbol].price)
-                self._price_calculator.get_performance_tracker().record_realization(
-                    contract_symbol_str, exit_price)
                 qty_sold, _ = self._close_position_with_log(symbol)
                 if qty_sold > 0:
                     self.debug(f"SELL {qty_sold} {symbol} @ ${exit_price:.2f}")
@@ -866,25 +1072,71 @@ class OptionsArbitrageAlgorithm:
         for symbol in list(self.portfolio.keys()):
             self._close_position_with_log(symbol)
 
+    def _run_pricing_evaluation(self):
+        """
+        Pricing experiment for this rebalance date — independent of the trading
+        account (runs even in a margin-halted week):
+          1. calibrate every model on the t−1 cross-section,
+          2. realize last rebalance's predictions from today's quoted chain,
+          3. train the GBR pricing ensemble on prior dates only,
+          4. price the stratified day-t universe and record it for OOS scoring.
+        Returns the prepared-options table (or None if no chain is available).
+        """
+        days_since = (self.time.date() - self._last_calibration_date).days
+        if days_since >= self._calibration_frequency_days:
+            self._calibrate_model_params()
+            self._last_calibration_date = self.time.date()
+        self._mark_to_market_realizations()
+
+        tracker = self._price_calculator.get_performance_tracker()
+        pred_df = tracker.get_prediction_dataframe()
+        if pred_df is not None and len(pred_df) >= self._min_samples_for_calibration:
+            try:
+                self._price_calculator.calibrate_ensemble_weights(pred_df[pred_df['date'] < self.time.date()])
+            except Exception as e:
+                self.debug(f"Pricing GBR failed: {e}")
+
+        if self._today_calib_df is None or self._today_calib_df.empty:
+            self.debug(f"No option chain at {self.time}")
+            return None
+        spot = float(self.securities[self._underlying_symbol].price)
+        universe = self._select_evaluation_universe(self._today_calib_df, spot)
+        if universe.empty:
+            self.debug("No contracts in the evaluation universe after filtering")
+            return None
+        self.debug(f"Evaluation universe: {len(universe)} contracts (stratified K/S × maturity)")
+        prepared = self._prepare_option_data(universe)
+        self._n_rebalances += 1
+
+        dm = tracker.run_diebold_mariano_tests('same_day')
+        if dm:
+            self.debug("DM (same-day, date-clustered) vs BS: " + "  ".join(
+                f"{k.replace('_vs_BS', '')} {v['DM_stat']:+.2f} (p={v['p_value']:.3f}, T={v['n_dates']})"
+                for k, v in dm.items()))
+        return prepared
+
     def _rebalance(self):
         if self.is_warming_up:
             return
+
+        self._update_price_history()
+        prepared_options = self._run_pricing_evaluation()
+
+        # ---- trading (does not feed back into the pricing experiment) ----
         if self._trading_halted:
+            self._n_halted_weeks += 1
             self.debug(f"TRADING HALTED – {self._halt_reason}")
             if self._spy_hedge_quantity != 0:
                 self.market_order(self._underlying_symbol, -self._spy_hedge_quantity)
                 self._spy_hedge_quantity = 0
             self._liquidate_all_positions()
+            # Liquidating frees essentially all margin, so re-check and resume
+            # once positions are flat and margin is available again.
+            if self._margin_has_recovered():
+                self.debug(f"Trading resumed — margin recovered (halt was: {self._halt_reason}).")
+                self._trading_halted = False
+                self._halt_reason    = None
             return
-
-        self._update_price_history()
-        precomputed_hurst = 0.5
-        try:
-            hurst_values = calculate_hurst_for_segments(
-                self._price_history['SPY'].values, 8)
-            precomputed_hurst = float(np.mean(hurst_values))
-        except Exception as e:
-            self.debug(f"Hurst calculation failed: {e}, using 0.5")
 
         current_pv = self.portfolio.total_portfolio_value
         if self._last_portfolio_value > 0:
@@ -911,39 +1163,15 @@ class OptionsArbitrageAlgorithm:
 
         self._pending_hypo_features = current_features
 
-        days_since = (self.time.date() - self._last_calibration_date).days
-        if days_since >= self._calibration_frequency_days:
-            self._attempt_ensemble_calibration()
-            self._last_calibration_date = self.time.date()
+        if len(self._strategy_history) >= StrategySelector.MIN_SAMPLES:
+            try:
+                self._strategy_selector.train(self._strategy_history, self)
+            except Exception as e:
+                self.debug(f"StrategySelector training failed: {e}")
 
-        chain = self._get_option_chain()
-        if chain is None or chain.empty:
-            self.debug(f"No option chain at {self.time}")
-            return
-        self.debug(f"Chain: {len(chain)} contracts")
-
-        # Restrict to near-ATM contracts with reasonable TTM before pricing.
-        # Pricing all ~6k contracts per rebalance is prohibitive; this mirrors
-        # the moneyness/TTM window used for calibration.
-        today = self.time.date()
-        spot  = float(self.securities[self._underlying_symbol].price)
-        chain = chain[
-            (chain['strike'] >= spot * 0.85) &
-            (chain['strike'] <= spot * 1.15) &
-            (chain['expiry'].apply(
-                lambda e: 7 <= (e.date() - today).days <= 90))
-        ].assign(_dist=lambda df: abs(df['strike'] - spot)
-        ).nsmallest(150, '_dist').drop(columns='_dist').reset_index(drop=True)
-        if chain.empty:
-            self.debug("No contracts in tradeable universe after ATM/TTM filter")
-            return
-        self.debug(f"Filtered to {len(chain)} tradeable contracts")
-
-        prepared_options = self._prepare_option_data(chain, precomputed_hurst)
-        if prepared_options.empty:
+        if prepared_options is None or prepared_options.empty:
             self.debug("No valid options after preparation")
             return
-        self.debug(f"Prepared {len(prepared_options)} options")
 
         current_price = self.securities[self._underlying_symbol].price
         market_data   = pd.Series({'SPY': current_price})
@@ -975,11 +1203,6 @@ class OptionsArbitrageAlgorithm:
         signals = self._active_strategy.generate_signals(
             self.time, market_data, prepared_options, self.portfolio, self)
 
-        if self._trading_halted:
-            signals = [s for s in signals if s['type'] == 'sell']
-            if not signals:
-                return
-
         net_delta_hedge = 0
         for signal in signals:
             net_delta_hedge += self._execute_signal(signal, prepared_options)
@@ -989,58 +1212,22 @@ class OptionsArbitrageAlgorithm:
             self._spy_hedge_quantity = net_delta_hedge
 
     def _mark_to_market_realizations(self):
-
-        tracker   = self._price_calculator.get_performance_tracker()
-        n_total   = len(tracker._prediction_history)
-        n_filled  = tracker.mark_open_predictions(self._securities._data)
-        n_realized = sum(1 for r in tracker._prediction_history
-                         if r['realized_price'] is not None)
-        self.debug(
-            f"MTM: history={n_total} predictions, "
-            f"+{n_filled} newly realized, "
-            f"{n_realized} total realized, "
-            f"{len(self._securities._data)} securities in dict"
-        )
-
-    def _attempt_ensemble_calibration(self):
-        # Calibrate pricing model params (NLS/MLE) on t-1 cross-section first
-        self._calibrate_model_params()
-        self.debug("Checking GBR ensemble calibration…")
+        """
+        Next-week realization: fill predictions made on the previous rebalance
+        date with the mids of today's quoted chain only. Contracts not quoted
+        today (e.g. expired) stay unrealized and are excluded from the
+        next-week metrics rather than back-filled with stale prices.
+        """
         tracker = self._price_calculator.get_performance_tracker()
-        # Mark-to-market before counting — ensures calibration data from week 1
-        self._mark_to_market_realizations()
-        calibration_df = tracker.get_calibration_dataframe()
-        if calibration_df is None or len(calibration_df) < self._min_samples_for_calibration:
-            self.debug(f"GBR skipped: {0 if calibration_df is None else len(calibration_df)} samples")
+        if self._last_eval_date is None or self._today_calib_df is None or self._today_calib_df.empty:
             return
-        metrics = tracker.get_model_accuracy_metrics()
-        if metrics:
-            self.debug(f"Model accuracy: {metrics}")
-        dm_results = tracker.run_diebold_mariano_tests()
-        if dm_results:
-            self.debug(f"DM tests: {dm_results}")
-        for regime, returns in self._regime_returns.items():
-            if len(returns) >= 10:
-                bs_result = block_bootstrap_sharpe(np.array(returns))
-                if bs_result:
-                    self.debug(
-                        f"Regime [{regime}] Sharpe={bs_result['observed_sharpe']:.3f} "
-                        f"95% CI=[{bs_result['ci_95_lower']:.3f},{bs_result['ci_95_upper']:.3f}]")
-        if len(self._all_weekly_returns) >= 10:
-            overall = block_bootstrap_sharpe(np.array(self._all_weekly_returns))
-            if overall:
-                self.debug(f"Overall Sharpe={overall['observed_sharpe']:.3f}")
-        try:
-            self._price_calculator.calibrate_ensemble_weights(calibration_df)
-            self.debug("Pricing GBR calibration complete")
-        except Exception as e:
-            self.debug(f"Pricing GBR failed: {e}")
-        if len(self._strategy_history) >= StrategySelector.MIN_SAMPLES:
-            try:
-                self._strategy_selector.train(self._strategy_history, self)
-                self.debug("StrategySelector GBR training complete")
-            except Exception as e:
-                self.debug(f"StrategySelector training failed: {e}")
+        day_mids = dict(zip(self._today_calib_df['contract_symbol'].astype(str),
+                            self._today_calib_df['mid_price'].astype(float)))
+        n_filled = tracker.mark_open_predictions(day_mids, from_date=self._last_eval_date)
+        n_prev = sum(1 for r in tracker._prediction_history
+                     if r['timestamp'].date() == self._last_eval_date)
+        self.debug(f"Next-week realization: {n_filled} of {n_prev} predictions from "
+                   f"{self._last_eval_date} quoted today")
 
     def _calculate_max_position_quantity(self, option_price, margin_buffer=0.3):
         avail   = self.portfolio.margin_remaining
@@ -1062,8 +1249,22 @@ class OptionsArbitrageAlgorithm:
         if available < required:
             if not self._trading_halted:
                 self._trading_halted = True
+                self._halt_reason = (
+                    f"insufficient margin (required ${required:,.0f} > "
+                    f"available ${available:,.0f})"
+                )
             return False
         return True
+
+    def _margin_has_recovered(self) -> bool:
+        """
+        True once open positions are flat and margin is available again — the
+        condition under which a margin-triggered halt can safely lift. Liquidating
+        on entry to the halted branch of _rebalance() closes every position, so
+        margin_remaining reverts to available cash; this only stays False if cash
+        itself has been driven to zero or negative by realized losses.
+        """
+        return len(self._portfolio._positions) == 0 and self.portfolio.margin_remaining > 0
 
     def _compute_option_delta(self, option_row):
         import datetime as dt_mod
@@ -1077,7 +1278,8 @@ class OptionsArbitrageAlgorithm:
         except (ValueError, AttributeError):
             ttm = 0.1
         sigma = max(self._price_calculator._last_volatility, 0.05)
-        return bs_delta(current_spot, strike, 0.052, sigma, ttm, option_type)
+        q = self._dividend_yield(self.time.date(), current_spot)
+        return bs_delta(current_spot, strike, RISK_FREE_RATE, sigma, ttm, option_type, q)
 
     def _compute_strategy_features(self):
         vol = self._price_calculator._last_volatility
@@ -1102,15 +1304,23 @@ class OptionsArbitrageAlgorithm:
                 'ma_deviation_20': float(ma_dev), 'hurst': float(hurst)}
 
     def _compute_hypo_returns(self, hypo_positions):
-
+        """
+        Approximate one-week return each strategy would have earned on last
+        week's signals (the strategy selector's learning target):
+            P&L_i = δ_i · r_SPY · S · q_i · 100 + Θ_i · (7/365) · q_i · 100
+        with δ_i and Θ_i the Black-Scholes delta and theta (per year, with the
+        dividend yield) at each contract's actual strike, type and time to
+        expiry, using the calibrated BS σ. Sign flips for written positions.
+        """
         returns = {}
         current_spy = float(self.securities[self._underlying_symbol].price)
-        sigma       = self._price_calculator._last_volatility or 0.20
+        sigma       = self._price_calculator._bs_sigma() or 0.20
+        q           = self._dividend_yield(self.time.date(), current_spy)
 
         # 1-week SPY return computed from the last 6 price bars (~5 trading days)
         if self._price_history is not None and len(self._price_history) >= 6:
             prev_spy    = float(self._price_history['SPY'].iloc[-6])
-            spy_return  = (current_spy - prev_spy) / prev_spy if prev_spy > 0 else 0.0
+            spy_return  = (float(self._price_history['SPY'].iloc[-1]) - prev_spy) / prev_spy if prev_spy > 0 else 0.0
         else:
             spy_return = 0.0
 
@@ -1122,20 +1332,17 @@ class OptionsArbitrageAlgorithm:
             for contract_symbol, sig_type, qty, entry_price in positions:
                 if entry_price is None or entry_price <= 0:
                     continue
-                # Parse option type and strike from symbol ('SPY YYMMDD C/PXXXXX')
-                sym_parts   = str(contract_symbol).split()
-                right_field = sym_parts[-1] if sym_parts else ''
-                opt_type    = 'call' if right_field.startswith('C') else 'put'
-                try:
-                    strike = float(right_field[1:])
-                except (ValueError, IndexError):
-                    strike = current_spy
-                ttm   = 14.0 / 365.25   # assume midpoint of the 14-21 DTE range
-                delta = bs_delta(current_spy, strike, 0.052, sigma, ttm, opt_type)
+                parsed = self._parse_contract(contract_symbol)
+                if parsed is None:
+                    continue
+                opt_type, strike, expiry = parsed
+                ttm = max((expiry - self.time.date()).days / 365.25, 1 / 365.25)
+                delta = bs_delta(current_spy, strike, RISK_FREE_RATE, sigma, ttm, opt_type, q)
+                theta = bs_theta(current_spy, strike, RISK_FREE_RATE, sigma, ttm, opt_type, q)
 
-                weekly_theta_decay = entry_price * 0.10
                 delta_pnl = delta * spy_return * current_spy * qty * 100
-                approx_pnl = delta_pnl - weekly_theta_decay * qty * 100
+                theta_pnl = theta * (7.0 / 365.0) * qty * 100
+                approx_pnl = delta_pnl + theta_pnl
                 if sig_type == 'write':
                     approx_pnl = -approx_pnl   # short: opposite exposure
                 total_pnl  += approx_pnl

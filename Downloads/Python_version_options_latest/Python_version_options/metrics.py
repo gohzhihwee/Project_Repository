@@ -14,6 +14,7 @@ def compute_portfolio_metrics(
     spy_returns: Optional[pd.Series] = None,
     initial_capital: float = 100_000.0,
     ann_factor: int = 52,
+    risk_free_rate: float = 0.0,
 ) -> dict:
     """
     Compute hedge-fund-grade portfolio metrics from backtest data.
@@ -26,6 +27,10 @@ def compute_portfolio_metrics(
     spy_returns : optional weekly SPY decimal returns aligned to equity dates
     initial_capital : starting portfolio value (default $100k)
     ann_factor : annualisation multiplier (52 for weekly data)
+    risk_free_rate : annual risk-free rate. Sharpe, Sortino and alpha are
+        computed on excess returns over the per-period rate
+        (1 + risk_free_rate)^(1/ann_factor) − 1; alpha is Jensen's alpha,
+        (r − r_f) = α + β(r_SPY − r_f). 'sharpe_raw' keeps the raw-return Sharpe.
 
     Returns
     -------
@@ -51,18 +56,21 @@ def compute_portfolio_metrics(
     # ── Annualised volatility ─────────────────────────────────────────────
     ann_vol = float(rets.std(ddof=1) * np.sqrt(ann_factor))
 
-    # ── Sharpe Ratio ──────────────────────────────────────────────────────
+    # ── Sharpe Ratio (excess over the risk-free rate) ─────────────────────
+    rf_period = float((1.0 + risk_free_rate) ** (1.0 / ann_factor) - 1.0)
+    ex = rets - rf_period
     std = float(rets.std(ddof=1))
-    sharpe = float(rets.mean() / std * np.sqrt(ann_factor)) if std > 0 else 0.0
+    sharpe = float(ex.mean() / std * np.sqrt(ann_factor)) if std > 0 else 0.0
+    sharpe_raw = float(rets.mean() / std * np.sqrt(ann_factor)) if std > 0 else 0.0
 
     # ── Sortino Ratio ─────────────────────────────────────────────────────
     # Uses downside deviation (returns < 0) only — more appropriate than
     # Sharpe for options strategies whose return distributions are asymmetric
     # (long gamma = right-skewed; short theta = left-skewed).  Penalising
     # upside variance equally (as Sharpe does) distorts the risk picture.
-    downside = rets[rets < 0]
+    downside = ex[ex < 0]
     ds_std = float(downside.std(ddof=1) * np.sqrt(ann_factor)) if len(downside) > 1 else 1e-9
-    sortino = float(rets.mean() * ann_factor / ds_std) if ds_std > 1e-9 else 0.0
+    sortino = float(ex.mean() * ann_factor / ds_std) if ds_std > 1e-9 else 0.0
 
     # ── Max Drawdown + Duration ───────────────────────────────────────────
     cummax = np.maximum.accumulate(values)
@@ -106,6 +114,8 @@ def compute_portfolio_metrics(
         'cagr':          round(cagr * 100, 2),
         'ann_vol':       round(ann_vol * 100, 2),
         'sharpe':        round(sharpe, 3),
+        'sharpe_raw':    round(sharpe_raw, 3),
+        'risk_free_rate': risk_free_rate,
         'sortino':       round(sortino, 3),
         'calmar':        round(calmar, 3),
         'max_drawdown':  round(mdd * 100, 2),
@@ -131,7 +141,8 @@ def compute_portfolio_metrics(
             port_r, spy_r = pair
             cov_mat = np.cov(port_r, spy_r, ddof=1)
             beta  = float(cov_mat[0, 1] / cov_mat[1, 1]) if cov_mat[1, 1] > 0 else 0.0
-            alpha_w = float(port_r.mean() - beta * spy_r.mean())
+            # Jensen's alpha on excess returns (β is unchanged by subtracting a constant).
+            alpha_w = float((port_r.mean() - rf_period) - beta * (spy_r.mean() - rf_period))
             alpha = float(alpha_w * ann_factor)
             active = port_r - spy_r
             te = float(active.std(ddof=1) * np.sqrt(ann_factor))
